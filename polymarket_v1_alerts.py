@@ -6,7 +6,6 @@ import json
 import os
 import smtplib
 import sqlite3
-import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -39,6 +38,8 @@ def fmt_ts(ms: int) -> str:
 
 def safe_float(x: Any) -> Optional[float]:
     try:
+        if x is None:
+            return None
         return float(x)
     except Exception:
         return None
@@ -46,12 +47,14 @@ def safe_float(x: Any) -> Optional[float]:
 def compute_odds(bid: Any, ask: Any) -> Optional[float]:
     b = safe_float(bid)
     a = safe_float(ask)
-    if b and a and 0 < b < 1 and 0 < a < 1:
+    # Prefer mid if both are in (0,1)
+    if b is not None and a is not None and 0 < b < 1 and 0 < a < 1:
         return (b + a) / 2
-    return b or a
+    # Otherwise return whichever exists
+    return b if b is not None else a
 
 def normalize_token_id(s: str) -> str:
-    return s.strip().lower()
+    return (s or "").strip().lower()
 
 def as_money(x: Optional[float]) -> str:
     if x is None:
@@ -61,6 +64,9 @@ def as_money(x: Optional[float]) -> str:
     if x >= 1_000:
         return f"${x/1_000:.1f}K"
     return f"${x:.0f}"
+
+def fmt_spread(spread: Optional[float]) -> str:
+    return f"{spread:.4f}" if spread is not None else "n/a"
 
 
 # =========================
@@ -75,6 +81,7 @@ def send_email(subject: str, body: str) -> None:
     email_from = os.getenv("ALERT_EMAIL_FROM")
     email_to = os.getenv("ALERT_EMAIL_TO")
 
+    # If not configured, silently skip
     if not all([host, user, pw, email_from, email_to]):
         return
 
@@ -109,13 +116,23 @@ class MarketMeta:
         return self.market_question
 
 
-def fetch_gamma_markets(per_page: int, pages: int) -> List[MarketMeta]:
+def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) -> List[MarketMeta]:
+    """
+    Fetch markets from Gamma API.
+
+    active_only=True  -> params include active=true
+    active_only=False -> no active param (returns broader set)
+    """
     metas: List[MarketMeta] = []
 
     for p in range(pages):
+        params = {"limit": per_page, "offset": p * per_page}
+        if active_only:
+            params["active"] = "true"
+
         r = requests.get(
             f"{GAMMA_BASE}/markets",
-            params={"limit": per_page, "offset": p * per_page, "active": "true"},
+            params=params,
             timeout=30,
         )
         r.raise_for_status()
@@ -136,6 +153,7 @@ def fetch_gamma_markets(per_page: int, pages: int) -> List[MarketMeta]:
                     clob_token_ids=[normalize_token_id(x) for x in clob_ids],
                 )
             )
+
     return metas
 
 
@@ -225,12 +243,20 @@ class OddsWatcher:
         return [m for m in self.metas if m.event_slug == meta.event_slug][:6]
 
     def run(self):
+        if not self.asset_ids:
+            print("No asset_ids found from Gamma. Nothing to subscribe to.")
+            return
+
         def on_open(ws):
             ws.send(json.dumps({"type": "market", "assets_ids": self.asset_ids}))
             print(f"Subscribed to {len(self.asset_ids)} tokens")
 
         def on_message(ws, msg):
-            p = json.loads(msg)
+            try:
+                p = json.loads(msg)
+            except Exception:
+                return
+
             if p.get("event_type") != "price_change":
                 return
 
@@ -243,12 +269,12 @@ class OddsWatcher:
                     continue
 
                 odds = compute_odds(pc.get("best_bid"), pc.get("best_ask"))
-                if odds is None:
+                if odds is None or odds <= 0:
                     continue
 
                 bid = safe_float(pc.get("best_bid"))
                 ask = safe_float(pc.get("best_ask"))
-                spread = ask - bid if bid and ask else None
+                spread = (ask - bid) if (bid is not None and ask is not None) else None
 
                 self.history[aid].append(PricePoint(ts, odds))
                 while self.history[aid] and self.history[aid][0].ts < ts - self.window_ms:
@@ -258,45 +284,54 @@ class OddsWatcher:
                     continue
 
                 start = self.history[aid][0]
+                if start.odds <= 0:
+                    continue
+
                 change = (odds - start.odds) / start.odds
                 if abs(change) < self.threshold:
                     continue
 
-                if meta.volume < self.min_volume or meta.liquidity < self.min_liquidity:
+                vol = meta.volume or 0.0
+                liq = meta.liquidity or 0.0
+                if vol < self.min_volume or liq < self.min_liquidity:
                     continue
 
-                if spread and spread > self.max_spread:
+                if spread is not None and spread > self.max_spread:
                     continue
 
                 if ts - self.last_alert.get(aid, 0) < 60_000:
                     continue
                 self.last_alert[aid] = ts
 
-                outcome = meta.outcomes[meta.clob_token_ids.index(aid)] if meta.outcomes else "n/a"
+                outcome = "n/a"
+                if meta.outcomes and aid in meta.clob_token_ids:
+                    idx = meta.clob_token_ids.index(aid)
+                    if 0 <= idx < len(meta.outcomes):
+                        outcome = meta.outcomes[idx]
+
                 direction = "UP" if change > 0 else "DOWN"
 
                 related = "\n".join(
                     f"- {m.market_question} ({as_money(m.volume)})"
                     for m in self.related_markets(meta)
+                ) or "n/a"
+
+                alert = (
+                    "=== POLY ALERT V1.1 ===\n"
+                    f"when: {fmt_ts(ts)}\n"
+                    f"market: {meta.title()}\n"
+                    f"outcome: {outcome}\n"
+                    f"move: {direction} {change*100:.2f}%\n"
+                    f"from: {start.odds:.4f} → {odds:.4f}\n"
+                    f"volume: {as_money(meta.volume)}\n"
+                    f"liquidity: {as_money(meta.liquidity)}\n"
+                    f"spread: {fmt_spread(spread)}\n\n"
+                    "Related markets:\n"
+                    f"{related}\n\n"
+                    f"asset_id: {aid}\n"
+                    "======================\n"
                 )
 
-                alert = f"""
-=== POLY ALERT V1.1 ===
-when: {fmt_ts(ts)}
-market: {meta.title()}
-outcome: {outcome}
-move: {direction} {change*100:.2f}%
-from: {start.odds:.4f} → {odds:.4f}
-volume: {as_money(meta.volume)}
-liquidity: {as_money(meta.liquidity)}
-spread: {spread:.4f if spread else 'n/a'}
-
-Related markets:
-{related}
-
-asset_id: {aid}
-======================
-"""
                 print(alert)
 
                 self.logger.log({
@@ -338,6 +373,13 @@ asset_id: {aid}
 
 def main():
     ap = argparse.ArgumentParser()
+
+    # IMPORTANT: Railway start command includes --gamma-active, so we must accept it.
+    # We make it control whether we include active=true on the Gamma call.
+    # If you want the old behavior (active only) even without the flag, set default True below.
+    ap.add_argument("--gamma-active", action="store_true",
+                    help="Filter Gamma markets to active=true (Railway uses this flag).")
+
     ap.add_argument("--pages", type=int, default=5)
     ap.add_argument("--per-page", type=int, default=100)
     ap.add_argument("--window-min", type=int, default=10)
@@ -349,7 +391,10 @@ def main():
     ap.add_argument("--email", action="store_true")
     args = ap.parse_args()
 
-    metas = fetch_gamma_markets(args.per_page, args.pages)
+    # If Railway passes --gamma-active, we’ll filter to active=true.
+    # If not passed, we fetch a broader set (no active param).
+    metas = fetch_gamma_markets(args.per_page, args.pages, active_only=args.gamma_active)
+
     logger = AlertLoggerSQLite(args.db_path)
 
     watcher = OddsWatcher(
