@@ -6,7 +6,6 @@ import json
 import os
 import smtplib
 import sqlite3
-import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -34,10 +33,8 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-
 def fmt_ts(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
-
 
 def safe_float(x: Any) -> Optional[float]:
     try:
@@ -47,18 +44,17 @@ def safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def compute_odds(bid: Any, ask: Any) -> Optional[float]:
     b = safe_float(bid)
     a = safe_float(ask)
+    # Prefer mid if both exist and are in (0,1)
     if b is not None and a is not None and 0 < b < 1 and 0 < a < 1:
         return (b + a) / 2
+    # Otherwise return whichever exists
     return b if b is not None else a
-
 
 def normalize_token_id(s: str) -> str:
     return (s or "").strip().lower()
-
 
 def as_money(x: Optional[float]) -> str:
     if x is None:
@@ -69,10 +65,8 @@ def as_money(x: Optional[float]) -> str:
         return f"${x/1_000:.1f}K"
     return f"${x:.0f}"
 
-
 def fmt_spread(spread: Optional[float]) -> str:
     return f"{spread:.4f}" if spread is not None else "n/a"
-
 
 def env_truthy(val: Optional[str]) -> bool:
     if val is None:
@@ -85,6 +79,17 @@ def env_truthy(val: Optional[str]) -> bool:
 # =========================
 
 def _get_email_config() -> dict:
+    """
+    Supports two env var naming schemes:
+
+    Scheme A (original):
+      ALERT_SMTP_HOST, ALERT_SMTP_PORT, ALERT_SMTP_USER, ALERT_SMTP_PASS
+      ALERT_EMAIL_FROM, ALERT_EMAIL_TO
+
+    Scheme B (your Railway screenshot style):
+      ALERT_SMTP_HOST/PORT/USER/PASS (or SMTP_HOST/PORT/USER/PASS)
+      EMAIL_FROM, EMAIL_TO, EMAIL_ENABLED
+    """
     host = os.getenv("ALERT_SMTP_HOST") or os.getenv("SMTP_HOST")
     port = int(os.getenv("ALERT_SMTP_PORT") or os.getenv("SMTP_PORT") or "587")
     user = os.getenv("ALERT_SMTP_USER") or os.getenv("SMTP_USER")
@@ -93,7 +98,9 @@ def _get_email_config() -> dict:
     email_from = os.getenv("ALERT_EMAIL_FROM") or os.getenv("EMAIL_FROM")
     email_to = os.getenv("ALERT_EMAIL_TO") or os.getenv("EMAIL_TO")
 
+    # Optional toggle
     enabled = env_truthy(os.getenv("EMAIL_ENABLED")) or env_truthy(os.getenv("ALERT_EMAIL_ENABLED"))
+    # If toggle not provided, enable if everything exists
     if os.getenv("EMAIL_ENABLED") is None and os.getenv("ALERT_EMAIL_ENABLED") is None:
         enabled = True
 
@@ -107,12 +114,13 @@ def _get_email_config() -> dict:
         "to": email_to,
     }
 
-
 def send_email(subject: str, body: str) -> None:
     cfg = _get_email_config()
     if not cfg["enabled"]:
         return
+
     if not all([cfg["host"], cfg["user"], cfg["pw"], cfg["from"], cfg["to"]]):
+        # Not configured; silently skip
         return
 
     msg = MIMEText(body)
@@ -120,8 +128,7 @@ def send_email(subject: str, body: str) -> None:
     msg["From"] = cfg["from"]
     msg["To"] = cfg["to"]
 
-    # SMTP connectivity may be blocked from cloud envs; let it raise to caller if desired
-    with smtplib.SMTP(cfg["host"], cfg["port"], timeout=20) as s:
+    with smtplib.SMTP(cfg["host"], cfg["port"]) as s:
         s.starttls()
         s.login(cfg["user"], cfg["pw"])
         s.sendmail(cfg["from"], [cfg["to"]], msg.as_string())
@@ -243,16 +250,10 @@ class OddsWatcher:
         email: bool,
         logger: AlertLoggerSQLite,
         heartbeat_sec: int = 60,
-        max_assets: int = 0,  # 0 = no cap
     ):
         self.metas = metas
         self.asset_to_meta = {tid: m for m in metas for tid in m.clob_token_ids}
-        asset_ids = list(self.asset_to_meta.keys())
-
-        if max_assets and max_assets > 0:
-            asset_ids = asset_ids[:max_assets]
-
-        self.asset_ids = asset_ids
+        self.asset_ids = list(self.asset_to_meta.keys())
 
         self.window_ms = window_min * 60 * 1000
         self.threshold = move_pct / 100
@@ -266,43 +267,20 @@ class OddsWatcher:
         self.last_alert: Dict[str, int] = {}
 
         self.heartbeat_sec = heartbeat_sec
+        self._last_heartbeat = time.time()
         self._last_msg_ts = time.time()
-
-        self._stop = threading.Event()
-        self._ws_connected = False
-        self._ws_lock = threading.Lock()
 
     def related_markets(self, meta: MarketMeta) -> List[MarketMeta]:
         if not meta.event_slug:
             return []
         return [m for m in self.metas if m.event_slug == meta.event_slug][:6]
 
-    def _set_connected(self, val: bool) -> None:
-        with self._ws_lock:
-            self._ws_connected = val
-
-    def _get_connected(self) -> bool:
-        with self._ws_lock:
-            return self._ws_connected
-
-    def _heartbeat_loop(self) -> None:
-        # prints forever until stop
-        while not self._stop.is_set():
-            idle = int(time.time() - self._last_msg_ts)
-            connected = self._get_connected()
-            print(f"[heartbeat] connected={connected} last_msg={idle}s ago assets={len(self.asset_ids)}")
-            self._stop.wait(self.heartbeat_sec)
-
     def run_forever(self) -> None:
         if not self.asset_ids:
             print("No asset_ids found from Gamma. Nothing to subscribe to.")
             return
 
-        hb = threading.Thread(target=self._heartbeat_loop, name="heartbeat", daemon=True)
-        hb.start()
-
         def on_open(ws):
-            self._set_connected(True)
             ws.send(json.dumps({"type": "market", "assets_ids": self.asset_ids}))
             print(f"Subscribed to {len(self.asset_ids)} tokens")
 
@@ -314,6 +292,7 @@ class OddsWatcher:
             except Exception:
                 return
 
+            # Some frames may be a list; normalize to list-of-dicts for processing
             if isinstance(payload, list):
                 items = payload
             elif isinstance(payload, dict):
@@ -325,19 +304,13 @@ class OddsWatcher:
                 if not isinstance(p, dict):
                     continue
 
+                # now safe:
                 if p.get("event_type") != "price_change":
                     continue
 
                 ts = p.get("timestamp", now_ms())
 
-                pcs = p.get("price_changes", [])
-                if not isinstance(pcs, list):
-                    continue
-
-                for pc in pcs:
-                    if not isinstance(pc, dict):
-                        continue
-
+                for pc in p.get("price_changes", []):
                     aid = normalize_token_id(pc.get("asset_id", ""))
                     meta = self.asset_to_meta.get(aid)
                     if not meta:
@@ -374,6 +347,7 @@ class OddsWatcher:
                     if spread is not None and spread > self.max_spread:
                         continue
 
+                    # Cooldown: 60 seconds per asset
                     if ts - self.last_alert.get(aid, 0) < 60_000:
                         continue
                     self.last_alert[aid] = ts
@@ -432,20 +406,23 @@ class OddsWatcher:
                     })
 
                     if self.email:
-                        try:
-                            send_email(f"[Polymarket] {direction} {change*100:.1f}%", alert)
-                        except Exception as e:
-                            print(f"[email] send failed: {e}")
+                        send_email(f"[Polymarket] {direction} {change*100:.1f}%", alert)
 
         def on_error(ws, err):
             print(f"[ws] error: {err}")
 
         def on_close(ws, code, reason):
-            self._set_connected(False)
             print(f"[ws] closed: code={code} reason={reason}")
 
+        def on_ping(ws, msg):
+            # optional visibility
+            pass
+
+        def on_pong(ws, msg):
+            # optional visibility
+            pass
+
         while True:
-            self._set_connected(False)
             try:
                 ws = WebSocketApp(
                     f"{CLOB_WS_BASE}/ws/market",
@@ -453,14 +430,26 @@ class OddsWatcher:
                     on_message=on_message,
                     on_error=on_error,
                     on_close=on_close,
+                    on_ping=on_ping,
+                    on_pong=on_pong,
                 )
+
+                # run_forever blocks; ping_interval helps keep connection alive
                 ws.run_forever(ping_interval=30, ping_timeout=10)
+
             except Exception as e:
-                self._set_connected(False)
                 print(f"[ws] run_forever exception: {e}")
 
+            # If we exit, reconnect after a short delay
             print("[ws] reconnecting in 5s...")
             time.sleep(5)
+
+            # Heartbeat print even across reconnect loops
+            now = time.time()
+            if now - self._last_heartbeat >= self.heartbeat_sec:
+                idle = int(now - self._last_msg_ts)
+                print(f"[heartbeat] running; last message {idle}s ago; subscribed assets={len(self.asset_ids)}")
+                self._last_heartbeat = now
 
 
 # =========================
@@ -470,27 +459,32 @@ class OddsWatcher:
 def main() -> None:
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--gamma-active", action="store_true", help="Filter Gamma markets to active=true.")
+    # Railway start command includes --gamma-active, so we must accept it.
+    ap.add_argument(
+        "--gamma-active",
+        action="store_true",
+        help="Filter Gamma markets to active=true. (Railway start command uses this.)",
+    )
+
     ap.add_argument("--pages", type=int, default=5)
     ap.add_argument("--per-page", type=int, default=100)
-
     ap.add_argument("--window-min", type=int, default=10)
     ap.add_argument("--move-pct", type=float, default=25)
     ap.add_argument("--min-volume", type=float, default=250_000)
     ap.add_argument("--min-liquidity", type=float, default=100_000)
     ap.add_argument("--max-spread", type=float, default=0.06)
-
     ap.add_argument("--db-path", type=str, default="data/alerts.db")
     ap.add_argument("--email", action="store_true")
-
     ap.add_argument("--heartbeat-sec", type=int, default=60)
-    ap.add_argument("--max-assets", type=int, default=15, help="Cap subscribed assets (0 = no cap). Default 15.")
 
     args = ap.parse_args()
 
-    metas = fetch_gamma_markets(args.per_page, args.pages, active_only=args.gamma_active)
-    total_assets = sum(len(m.clob_token_ids) for m in metas)
-    print(f"Loaded {len(metas)} markets from Gamma (assets total: {total_assets})")
+    metas = fetch_gamma_markets(
+        args.per_page,
+        args.pages,
+        active_only=args.gamma_active,  # if flag is present, active=true; otherwise broader set
+    )
+    print(f"Loaded {len(metas)} markets from Gamma (assets total: {sum(len(m.clob_token_ids) for m in metas)})")
 
     logger = AlertLoggerSQLite(args.db_path)
 
@@ -504,10 +498,10 @@ def main() -> None:
         email=args.email,
         logger=logger,
         heartbeat_sec=args.heartbeat_sec,
-        max_assets=args.max_assets,
     )
 
     if args.email:
+        # Optional sanity ping if email is enabled + configured
         try:
             send_email("[Polymarket] Worker started", "Polymarket alerts worker started successfully.")
         except Exception as e:
