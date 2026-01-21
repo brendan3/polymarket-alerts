@@ -4,7 +4,7 @@
       "builder": "NIXPACKS"
     },
     "deploy": {
-      "startCommand": "python polymarket_v1_alerts.py --gamma-active --pages 5 --per-page 100 --window-min 10 --move-pct 25 --min-volume 250000 --min-liquidity 100000 --email --heartbeat-sec 60",
+      "startCommand": "python3 polymarket_v1_alerts.py --gamma-active --pages 5 --per-page 100 --window-min 10 --move-pct 25 --min-volume 250000 --min-liquidity 100000 --heartbeat-sec 60 --max-assets 350 --email",
       "restartPolicyType": "ALWAYS"
     }
   }
