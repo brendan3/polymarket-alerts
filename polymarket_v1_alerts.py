@@ -288,112 +288,125 @@ class OddsWatcher:
             self._last_msg_ts = time.time()
 
             try:
-                p = json.loads(msg)
+                payload = json.loads(msg)
             except Exception:
                 return
 
-            if p.get("event_type") != "price_change":
+            # Some frames may be a list; normalize to list-of-dicts for processing
+            if isinstance(payload, list):
+                items = payload
+            elif isinstance(payload, dict):
+                items = [payload]
+            else:
                 return
 
-            ts = p.get("timestamp", now_ms())
-
-            for pc in p.get("price_changes", []):
-                aid = normalize_token_id(pc.get("asset_id", ""))
-                meta = self.asset_to_meta.get(aid)
-                if not meta:
+            for p in items:
+                if not isinstance(p, dict):
                     continue
 
-                odds = compute_odds(pc.get("best_bid"), pc.get("best_ask"))
-                if odds is None or odds <= 0:
+                # now safe:
+                if p.get("event_type") != "price_change":
                     continue
 
-                bid = safe_float(pc.get("best_bid"))
-                ask = safe_float(pc.get("best_ask"))
-                spread = (ask - bid) if (bid is not None and ask is not None) else None
+                ts = p.get("timestamp", now_ms())
 
-                self.history[aid].append(PricePoint(ts, odds))
-                while self.history[aid] and self.history[aid][0].ts < ts - self.window_ms:
-                    self.history[aid].popleft()
+                for pc in p.get("price_changes", []):
+                    aid = normalize_token_id(pc.get("asset_id", ""))
+                    meta = self.asset_to_meta.get(aid)
+                    if not meta:
+                        continue
 
-                if len(self.history[aid]) < 2:
-                    continue
+                    odds = compute_odds(pc.get("best_bid"), pc.get("best_ask"))
+                    if odds is None or odds <= 0:
+                        continue
 
-                start = self.history[aid][0]
-                if start.odds <= 0:
-                    continue
+                    bid = safe_float(pc.get("best_bid"))
+                    ask = safe_float(pc.get("best_ask"))
+                    spread = (ask - bid) if (bid is not None and ask is not None) else None
 
-                change = (odds - start.odds) / start.odds
-                if abs(change) < self.threshold:
-                    continue
+                    self.history[aid].append(PricePoint(ts, odds))
+                    while self.history[aid] and self.history[aid][0].ts < ts - self.window_ms:
+                        self.history[aid].popleft()
 
-                vol = meta.volume or 0.0
-                liq = meta.liquidity or 0.0
-                if vol < self.min_volume or liq < self.min_liquidity:
-                    continue
+                    if len(self.history[aid]) < 2:
+                        continue
 
-                if spread is not None and spread > self.max_spread:
-                    continue
+                    start = self.history[aid][0]
+                    if start.odds <= 0:
+                        continue
 
-                # Cooldown: 60 seconds per asset
-                if ts - self.last_alert.get(aid, 0) < 60_000:
-                    continue
-                self.last_alert[aid] = ts
+                    change = (odds - start.odds) / start.odds
+                    if abs(change) < self.threshold:
+                        continue
 
-                outcome = "n/a"
-                if meta.outcomes and aid in meta.clob_token_ids:
-                    idx = meta.clob_token_ids.index(aid)
-                    if 0 <= idx < len(meta.outcomes):
-                        outcome = meta.outcomes[idx]
+                    vol = meta.volume or 0.0
+                    liq = meta.liquidity or 0.0
+                    if vol < self.min_volume or liq < self.min_liquidity:
+                        continue
 
-                direction = "UP" if change > 0 else "DOWN"
+                    if spread is not None and spread > self.max_spread:
+                        continue
 
-                related = "\n".join(
-                    f"- {m.market_question} ({as_money(m.volume)})"
-                    for m in self.related_markets(meta)
-                ) or "n/a"
+                    # Cooldown: 60 seconds per asset
+                    if ts - self.last_alert.get(aid, 0) < 60_000:
+                        continue
+                    self.last_alert[aid] = ts
 
-                alert = (
-                    "=== POLY ALERT V1.1 ===\n"
-                    f"when: {fmt_ts(ts)}\n"
-                    f"market: {meta.title()}\n"
-                    f"outcome: {outcome}\n"
-                    f"move: {direction} {change*100:.2f}%\n"
-                    f"from: {start.odds:.4f} → {odds:.4f}\n"
-                    f"volume: {as_money(meta.volume)}\n"
-                    f"liquidity: {as_money(meta.liquidity)}\n"
-                    f"spread: {fmt_spread(spread)}\n\n"
-                    "Related markets:\n"
-                    f"{related}\n\n"
-                    f"asset_id: {aid}\n"
-                    "======================\n"
-                )
+                    outcome = "n/a"
+                    if meta.outcomes and aid in meta.clob_token_ids:
+                        idx = meta.clob_token_ids.index(aid)
+                        if 0 <= idx < len(meta.outcomes):
+                            outcome = meta.outcomes[idx]
 
-                print(alert)
+                    direction = "UP" if change > 0 else "DOWN"
 
-                self.logger.log({
-                    "ts_ms": ts,
-                    "ts_iso": fmt_ts(ts),
-                    "market_title": meta.market_question,
-                    "event_title": meta.event_title,
-                    "outcome": outcome,
-                    "from_odds": start.odds,
-                    "to_odds": odds,
-                    "move_pct": change * 100,
-                    "volume": meta.volume,
-                    "liquidity": meta.liquidity,
-                    "best_bid": bid,
-                    "best_ask": ask,
-                    "spread": spread,
-                    "asset_id": aid,
-                    "ws_market_id": p.get("market"),
-                    "decision": None,
-                    "notes": None,
-                    "result": "OPEN",
-                    "pnl": None,
-                })
+                    related = "\n".join(
+                        f"- {m.market_question} ({as_money(m.volume)})"
+                        for m in self.related_markets(meta)
+                    ) or "n/a"
 
-                if self.email:
-                    send_email(f"[Polymarket] {direction} {change*100:.1f}%", alert)
+                    alert = (
+                        "=== POLY ALERT V1.1 ===\n"
+                        f"when: {fmt_ts(ts)}\n"
+                        f"market: {meta.title()}\n"
+                        f"outcome: {outcome}\n"
+                        f"move: {direction} {change*100:.2f}%\n"
+                        f"from: {start.odds:.4f} → {odds:.4f}\n"
+                        f"volume: {as_money(meta.volume)}\n"
+                        f"liquidity: {as_money(meta.liquidity)}\n"
+                        f"spread: {fmt_spread(spread)}\n\n"
+                        "Related markets:\n"
+                        f"{related}\n\n"
+                        f"asset_id: {aid}\n"
+                        "======================\n"
+                    )
+
+                    print(alert)
+
+                    self.logger.log({
+                        "ts_ms": ts,
+                        "ts_iso": fmt_ts(ts),
+                        "market_title": meta.market_question,
+                        "event_title": meta.event_title,
+                        "outcome": outcome,
+                        "from_odds": start.odds,
+                        "to_odds": odds,
+                        "move_pct": change * 100,
+                        "volume": meta.volume,
+                        "liquidity": meta.liquidity,
+                        "best_bid": bid,
+                        "best_ask": ask,
+                        "spread": spread,
+                        "asset_id": aid,
+                        "ws_market_id": p.get("market"),
+                        "decision": None,
+                        "notes": None,
+                        "result": "OPEN",
+                        "pnl": None,
+                    })
+
+                    if self.email:
+                        send_email(f"[Polymarket] {direction} {change*100:.1f}%", alert)
 
         def on_error(ws, err):
             print(f"[ws] error: {err}")
