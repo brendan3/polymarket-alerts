@@ -308,22 +308,70 @@ class MarketWatcher:
           - market passes min volume/liquidity
           - rank by (liquidity, volume) desc
           - take up to max_assets
+        Adds verbose logging so you can see why/how assets were chosen.
         """
-        candidates: List[Tuple[float, float, str]] = []
+        total_markets = len(self.metas)
+        passed_markets = 0
+        filtered_volume = 0
+        filtered_liquidity = 0
+
+        # candidates are (liq, vol, aid, meta)
+        candidates: List[Tuple[float, float, str, MarketMeta]] = []
+
         for m in self.metas:
             vol = m.volume or 0.0
             liq = m.liquidity or 0.0
-            if vol < self.min_volume or liq < self.min_liquidity:
+
+            if vol < self.min_volume:
+                filtered_volume += 1
                 continue
+            if liq < self.min_liquidity:
+                filtered_liquidity += 1
+                continue
+
+            passed_markets += 1
             for aid in m.clob_token_ids:
-                candidates.append((liq, vol, aid))
+                candidates.append((liq, vol, aid, m))
 
         # sort by liquidity desc then volume desc
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
+        # Print summary
+        print(
+            "[asset_select] markets_total=%d passed=%d filtered_volume=%d filtered_liquidity=%d "
+            "candidates=%d min_volume=%.2f min_liquidity=%.2f max_assets=%d"
+            % (
+                total_markets,
+                passed_markets,
+                filtered_volume,
+                filtered_liquidity,
+                len(candidates),
+                self.min_volume,
+                self.min_liquidity,
+                self.max_assets,
+            )
+        )
+
+        # Print top candidates (preview)
+        preview_n = min(30, len(candidates))
+        if preview_n > 0:
+            print(f"[asset_select] Top {preview_n} candidates by (liquidity, volume):")
+            for i in range(preview_n):
+                liq, vol, aid, meta = candidates[i]
+                title = meta.title()
+                # prevent mega-long log lines
+                if len(title) > 120:
+                    title = title[:117] + "..."
+                print(
+                    f"  #{i+1:02d} aid={aid} liq={liq:,.0f} vol={vol:,.0f} market='{title}'"
+                )
+        else:
+            print("[asset_select] No candidates after filtering.")
+
+        # Pick unique assets
         picked: List[str] = []
         seen = set()
-        for _, _, aid in candidates:
+        for liq, vol, aid, meta in candidates:
             if aid in seen:
                 continue
             seen.add(aid)
@@ -331,9 +379,29 @@ class MarketWatcher:
             if self.max_assets and len(picked) >= self.max_assets:
                 break
 
+        # Fallback if nothing passed filters
         if not picked:
-            # fallback: subscribe to *something* so the service isn't "dead"
-            picked = list(self.asset_to_meta.keys())[: min(50, len(self.asset_to_meta))]
+            fallback = list(self.asset_to_meta.keys())
+            picked = fallback[: min(50, len(fallback))]
+            print(
+                f"[asset_select] FALLBACK: no markets passed filters; subscribing to {len(picked)} assets from asset_to_meta"
+            )
+
+        # If you only want to log the first 50 selected, keep it readable
+        log_selected_n = min(50, len(picked))
+        print(f"[asset_select] Selected assets (showing {log_selected_n}/{len(picked)}):")
+        for i in range(log_selected_n):
+            aid = picked[i]
+            meta = self.asset_to_meta.get(aid)
+            if not meta:
+                print(f"  #{i+1:02d} aid={aid} meta=n/a")
+                continue
+            liq = meta.liquidity or 0.0
+            vol = meta.volume or 0.0
+            title = meta.title()
+            if len(title) > 120:
+                title = title[:117] + "..."
+            print(f"  #{i+1:02d} aid={aid} liq={liq:,.0f} vol={vol:,.0f} market='{title}'")
 
         print(f"Subscription set: {len(picked)} assets (max_assets={self.max_assets})")
         return picked
@@ -538,6 +606,17 @@ class MarketWatcher:
                 return
 
             items = payload if isinstance(payload, list) else [payload]
+
+            # lightweight message-type counter (prints every 200 messages)
+            self._msg_count = getattr(self, "_msg_count", 0) + 1
+            if self._msg_count % 200 == 0:
+                types = {}
+                for it in items:
+                    if isinstance(it, dict):
+                        t = it.get("event_type", "unknown")
+                        types[t] = types.get(t, 0) + 1
+                print(f"[ws] msg_count={self._msg_count} recent_types={types}")
+
             for p in items:
                 if not isinstance(p, dict):
                     continue
