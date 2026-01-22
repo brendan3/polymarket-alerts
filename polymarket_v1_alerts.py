@@ -67,6 +67,47 @@ def compute_odds(bid: Any, ask: Any) -> Optional[float]:
 def normalize_token_id(s: str) -> str:
     return (s or "").strip().lower()
 
+def coerce_clob_token_ids(raw: Any) -> List[str]:
+    """
+    Gamma sometimes returns clobTokenIds as:
+      - list[str]
+      - a JSON-encoded string like '["id1","id2"]'
+      - a comma-separated string like 'id1,id2'
+    This normalizes to List[str].
+    """
+    if raw is None:
+        return []
+
+    # Already a list/tuple
+    if isinstance(raw, (list, tuple)):
+        return [normalize_token_id(str(x)) for x in raw if str(x).strip()]
+
+    # Sometimes it's a string
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+
+        # JSON list in a string
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith('"[') and s.endswith(']"')):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [normalize_token_id(str(x)) for x in parsed if str(x).strip()]
+            except Exception:
+                pass
+
+        # Comma-separated fallback
+        if "," in s:
+            parts = [p.strip() for p in s.split(",")]
+            return [normalize_token_id(p.strip('"').strip("'")) for p in parts if p.strip('"').strip("'")]
+
+        # Single token id string
+        return [normalize_token_id(s.strip('"').strip("'"))]
+
+    # Anything else: last resort
+    return [normalize_token_id(str(raw))] if str(raw).strip() else []
+
 def as_money(x: Optional[float]) -> str:
     if x is None:
         return "n/a"
@@ -177,7 +218,8 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
         r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
         r.raise_for_status()
         for m in r.json():
-            clob_ids = m.get("clobTokenIds") or []
+            raw_clob = m.get("clobTokenIds")
+            clob_ids = coerce_clob_token_ids(raw_clob)
             if not clob_ids:
                 continue
             metas.append(
@@ -188,9 +230,16 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
                     volume=safe_float(m.get("volume")),
                     liquidity=safe_float(m.get("liquidity")),
                     outcomes=m.get("outcomes") or [],
-                    clob_token_ids=[normalize_token_id(x) for x in clob_ids],
+                    clob_token_ids=clob_ids,
                 )
             )
+    
+    # Defensive check for suspicious token IDs
+    bad = [m for m in metas if any(len(tid) <= 2 for tid in m.clob_token_ids)]
+    print(f"[sanity] markets_with_suspicious_token_ids={len(bad)}")
+    if bad[:3]:
+        print("[sanity] example suspicious token ids:", bad[0].clob_token_ids[:10])
+    
     return metas
 
 
