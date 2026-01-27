@@ -126,6 +126,82 @@ def env_truthy(val: Optional[str]) -> bool:
         return False
     return val.strip().lower() in {"1", "true", "yes", "y", "on"}
 
+def to_bool(value: Any) -> bool:
+    """
+    Robust boolean parser that handles:
+    - bool: True/False
+    - str: "true"/"false", "1"/"0", "yes"/"no" (case-insensitive)
+    - int: 1/0
+    - None: False
+    - Anything else: False
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value != 0)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"true", "1", "yes", "y", "on"}:
+            return True
+        if s in {"false", "0", "no", "n", "off", ""}:
+            return False
+    return False
+
+def parse_end_date(value: Any, now_ts: float) -> Optional[float]:
+    """
+    Parse endDate from various formats and return unix timestamp if valid and in past.
+    Returns None if:
+    - value is None/missing
+    - parsing fails
+    - date is in the future
+    Returns unix timestamp if date is in the past.
+    """
+    if value is None:
+        return None
+    
+    # Try unix timestamp (int or float)
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        # Sanity check: reasonable timestamp range (2000-2100)
+        if 946684800 <= ts <= 4102444800:
+            return ts if ts < now_ts else None
+    
+    # Try ISO datetime string
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            # Handle Z suffix (UTC indicator)
+            if s.endswith("Z"):
+                # Remove Z and check if timezone already exists
+                s_no_z = s[:-1]
+                if "+" in s_no_z or (s_no_z.count("-") >= 5 and ":" in s_no_z[-6:]):
+                    # Already has timezone, just remove Z
+                    s = s_no_z
+                else:
+                    # No timezone, add UTC
+                    s = s_no_z + "+00:00"
+            elif "+" not in s and "-" in s and s.count("-") >= 2:
+                # Might be ISO without timezone, assume UTC
+                if "T" in s:
+                    s = s + "+00:00"
+            dt = datetime.fromisoformat(s)
+            ts = dt.timestamp()
+            return ts if ts < now_ts else None
+        except Exception:
+            # Try parsing as unix timestamp string
+            try:
+                ts = float(s)
+                if 946684800 <= ts <= 4102444800:
+                    return ts if ts < now_ts else None
+            except Exception:
+                pass
+    
+    return None
+
 
 # =========================
 # Email & Telegram
@@ -210,11 +286,18 @@ class MarketMeta:
             return f"{self.event_title} — {self.market_question}"
         return self.market_question
 
-def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) -> List[MarketMeta]:
+def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) -> Tuple[List[MarketMeta], int]:
+    """
+    Fetch markets from Gamma API and filter by closed/endDate.
+    Returns (metas, raw_markets_count) for safety valve logic.
+    """
     metas: List[MarketMeta] = []
     now_ts = time.time()
     filtered_closed = 0
     filtered_enddate = 0
+    raw_markets_count = 0
+    debug_markets = env_truthy(os.getenv("DEBUG_MARKETS"))
+    debug_samples_logged = 0
     
     for p in range(pages):
         params = {"limit": per_page, "offset": p * per_page}
@@ -222,24 +305,35 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
             params["active"] = "true"
         r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
         r.raise_for_status()
-        for m in r.json():
-            # Skip closed markets
-            if m.get("closed") is True:
+        markets = r.json()
+        raw_markets_count += len(markets)
+        
+        for m in markets:
+            # DEBUG: Sample first 3 markets to log field types/values
+            if debug_markets and debug_samples_logged < 3:
+                closed_val = m.get("closed")
+                end_date_val = m.get("endDate")
+                volume_val = m.get("volume")
+                liquidity_val = m.get("liquidity")
+                print(
+                    f"[DEBUG_MARKETS] market[{debug_samples_logged}] "
+                    f"closed={closed_val!r} (type={type(closed_val).__name__}), "
+                    f"endDate={end_date_val!r} (type={type(end_date_val).__name__}), "
+                    f"volume={volume_val!r} (type={type(volume_val).__name__}), "
+                    f"liquidity={liquidity_val!r} (type={type(liquidity_val).__name__})"
+                )
+                debug_samples_logged += 1
+            
+            # Skip closed markets (robust parsing)
+            if to_bool(m.get("closed")):
                 filtered_closed += 1
                 continue
             
-            # Skip markets with endDate in the past
-            end_date_str = m.get("endDate")
-            if end_date_str:
-                try:
-                    # Parse ISO format date string
-                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                    if end_dt.timestamp() < now_ts:
-                        filtered_enddate += 1
-                        continue
-                except Exception:
-                    # If parsing fails, skip this check (don't filter)
-                    pass
+            # Skip markets with endDate in the past (robust parsing)
+            end_date_ts = parse_end_date(m.get("endDate"), now_ts)
+            if end_date_ts is not None:
+                filtered_enddate += 1
+                continue
             
             raw_clob = m.get("clobTokenIds")
             clob_ids = coerce_clob_token_ids(raw_clob)
@@ -257,8 +351,53 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
                 )
             )
     
-    if filtered_closed > 0 or filtered_enddate > 0:
-        print(f"[market_filter] filtered_closed={filtered_closed} filtered_enddate={filtered_enddate}")
+    print(
+        f"[market_filter] raw_markets={raw_markets_count} "
+        f"filtered_closed={filtered_closed} filtered_enddate={filtered_enddate} "
+        f"remaining={len(metas)}"
+    )
+    
+    # Safety valve: if filtering eliminated >99% of markets, disable filters
+    if raw_markets_count > 0 and len(metas) == 0:
+        print(
+            f"[WARNING] All {raw_markets_count} markets filtered out! "
+            f"Disabling closed/endDate filters as safety valve."
+        )
+        # Re-fetch without closed/endDate filters
+        metas = []
+        filtered_closed = 0
+        filtered_enddate = 0
+        for p in range(pages):
+            params = {"limit": per_page, "offset": p * per_page}
+            if active_only:
+                params["active"] = "true"
+            r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
+            r.raise_for_status()
+            for m in r.json():
+                raw_clob = m.get("clobTokenIds")
+                clob_ids = coerce_clob_token_ids(raw_clob)
+                if not clob_ids:
+                    continue
+                metas.append(
+                    MarketMeta(
+                        market_question=m.get("question") or "Unknown",
+                        event_title=m.get("title") or "",
+                        event_slug=m.get("eventSlug"),
+                        volume=safe_float(m.get("volume")),
+                        liquidity=safe_float(m.get("liquidity")),
+                        outcomes=m.get("outcomes") or [],
+                        clob_token_ids=clob_ids,
+                    )
+                )
+        print(f"[market_filter] Safety valve: {len(metas)} markets loaded (filters disabled)")
+    elif raw_markets_count > 0:
+        filter_pct = 100.0 * (filtered_closed + filtered_enddate) / raw_markets_count
+        if filter_pct > 99.0:
+            print(
+                f"[WARNING] Filtering eliminated {filter_pct:.1f}% of markets "
+                f"({filtered_closed + filtered_enddate}/{raw_markets_count}). "
+                f"Consider reviewing filter logic."
+            )
     
     # Defensive check for suspicious token IDs
     bad = [m for m in metas if any(len(tid) <= 2 for tid in m.clob_token_ids)]
@@ -266,7 +405,7 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
     if bad[:3]:
         print("[sanity] example suspicious token ids:", bad[0].clob_token_ids[:10])
     
-    return metas
+    return metas, raw_markets_count
 
 
 # =========================
@@ -792,36 +931,136 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    metas = fetch_gamma_markets(args.per_page, args.pages, active_only=args.gamma_active)
-    total_assets = sum(len(m.clob_token_ids) for m in metas)
-    print(f"Loaded {len(metas)} markets from Gamma (assets total: {total_assets})")
+    # Retry loop with backoff if no assets selected
+    backoff_sec = 60
+    max_backoff = 600  # 10 minutes max
+    
+    while True:
+        metas, raw_markets_count = fetch_gamma_markets(args.per_page, args.pages, active_only=args.gamma_active)
+        total_assets = sum(len(m.clob_token_ids) for m in metas)
+        print(f"Loaded {len(metas)} markets from Gamma (assets total: {total_assets})")
 
-    logger = AlertLoggerSQLite(args.db_path)
+        logger = AlertLoggerSQLite(args.db_path)
 
-    watcher = MarketWatcher(
-        metas,
-        window_min=args.window_min,
-        move_pct=args.move_pct,
-        min_volume=args.min_volume,
-        min_liquidity=args.min_liquidity,
-        max_spread=args.max_spread,
-        max_assets=args.max_assets,
-        whale_threshold=args.whale_threshold,
-        whale_cooldown_sec=args.whale_cooldown,
-        email=args.email,
-        telegram=args.telegram,
-        logger=logger,
-        heartbeat_sec=args.heartbeat_sec,
-    )
+        watcher = MarketWatcher(
+            metas,
+            window_min=args.window_min,
+            move_pct=args.move_pct,
+            min_volume=args.min_volume,
+            min_liquidity=args.min_liquidity,
+            max_spread=args.max_spread,
+            max_assets=args.max_assets,
+            whale_threshold=args.whale_threshold,
+            whale_cooldown_sec=args.whale_cooldown,
+            email=args.email,
+            telegram=args.telegram,
+            logger=logger,
+            heartbeat_sec=args.heartbeat_sec,
+        )
 
-    # Optional startup message
-    if args.telegram:
-        send_telegram_message("Polymarket alerts worker started ✅")
-    if args.email:
-        send_email("[Polymarket] Worker started", "Polymarket alerts worker started ✅")
+        # Check if we have assets to subscribe to
+        if not watcher.asset_ids or len(watcher.asset_ids) == 0:
+            print(
+                f"[WARNING] No assets selected (raw_markets={raw_markets_count}, "
+                f"metas={len(metas)}, assets={len(watcher.asset_ids)}). "
+                f"Retrying in {backoff_sec}s..."
+            )
+            time.sleep(backoff_sec)
+            backoff_sec = min(backoff_sec * 2, max_backoff)
+            continue
+        
+        # Reset backoff on success
+        backoff_sec = 60
 
-    watcher.run_forever()
+        # Optional startup message
+        if args.telegram:
+            send_telegram_message("Polymarket alerts worker started ✅")
+        if args.email:
+            send_email("[Polymarket] Worker started", "Polymarket alerts worker started ✅")
+
+        watcher.run_forever()
+        
+        # If run_forever returns (shouldn't happen, but handle gracefully)
+        print("[main] watcher.run_forever() returned, restarting market fetch...")
+        time.sleep(10)
+
+
+# =========================
+# Test Functions
+# =========================
+
+def test_market_filtering():
+    """
+    Test market filtering logic with various closed/endDate type combinations.
+    This helps verify the to_bool() and parse_end_date() helpers work correctly.
+    """
+    now_ts = time.time()
+    past_ts = now_ts - 86400  # 1 day ago
+    future_ts = now_ts + 86400  # 1 day in future
+    
+    test_markets = [
+        # Test closed field variations
+        {"closed": True, "endDate": None, "clobTokenIds": ["token1"], "question": "Test 1"},
+        {"closed": False, "endDate": None, "clobTokenIds": ["token2"], "question": "Test 2"},
+        {"closed": "true", "endDate": None, "clobTokenIds": ["token3"], "question": "Test 3"},
+        {"closed": "false", "endDate": None, "clobTokenIds": ["token4"], "question": "Test 4"},
+        {"closed": "True", "endDate": None, "clobTokenIds": ["token5"], "question": "Test 5"},
+        {"closed": 1, "endDate": None, "clobTokenIds": ["token6"], "question": "Test 6"},
+        {"closed": 0, "endDate": None, "clobTokenIds": ["token7"], "question": "Test 7"},
+        {"closed": None, "endDate": None, "clobTokenIds": ["token8"], "question": "Test 8"},
+        
+        # Test endDate field variations
+        {"closed": False, "endDate": past_ts, "clobTokenIds": ["token9"], "question": "Test 9"},
+        {"closed": False, "endDate": str(past_ts), "clobTokenIds": ["token10"], "question": "Test 10"},
+        {"closed": False, "endDate": datetime.fromtimestamp(past_ts, tz=timezone.utc).isoformat(), "clobTokenIds": ["token11"], "question": "Test 11"},
+        {"closed": False, "endDate": datetime.fromtimestamp(past_ts, tz=timezone.utc).isoformat() + "Z", "clobTokenIds": ["token12"], "question": "Test 12"},
+        {"closed": False, "endDate": future_ts, "clobTokenIds": ["token13"], "question": "Test 13"},
+        {"closed": False, "endDate": None, "clobTokenIds": ["token14"], "question": "Test 14"},
+        
+        # Combined cases
+        {"closed": "false", "endDate": None, "clobTokenIds": ["token15"], "question": "Test 15"},
+        {"closed": True, "endDate": past_ts, "clobTokenIds": ["token16"], "question": "Test 16"},
+    ]
+    
+    print("[test] Testing market filtering with various field types...")
+    print(f"[test] now_ts={now_ts} ({datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()})")
+    
+    passed = 0
+    filtered_closed = 0
+    filtered_enddate = 0
+    
+    for m in test_markets:
+        # Test closed filter
+        if to_bool(m.get("closed")):
+            filtered_closed += 1
+            continue
+        
+        # Test endDate filter
+        end_date_ts = parse_end_date(m.get("endDate"), now_ts)
+        if end_date_ts is not None:
+            filtered_enddate += 1
+            continue
+        
+        # Market passed filters
+        passed += 1
+        print(f"[test] PASSED: {m['question']} (closed={m.get('closed')!r}, endDate={m.get('endDate')!r})")
+    
+    print(f"[test] Results: total={len(test_markets)} passed={passed} filtered_closed={filtered_closed} filtered_enddate={filtered_enddate}")
+    
+    # Expected: token2, token4, token7, token8, token13, token14, token15 should pass
+    # (closed=False/0/None and endDate=None/future)
+    expected_passed = 7
+    if passed == expected_passed:
+        print("[test] ✅ Test passed!")
+        return True
+    else:
+        print(f"[test] ❌ Test failed! Expected {expected_passed} passed, got {passed}")
+        return False
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_market_filtering()
+    else:
+        main()
