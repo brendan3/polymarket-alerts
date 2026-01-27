@@ -296,8 +296,7 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
     filtered_closed = 0
     filtered_enddate = 0
     raw_markets_count = 0
-    debug_markets = env_truthy(os.getenv("DEBUG_MARKETS"))
-    debug_samples_logged = 0
+    samples_logged = 0
     
     for p in range(pages):
         params = {"limit": per_page, "offset": p * per_page}
@@ -309,23 +308,34 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
         raw_markets_count += len(markets)
         
         for m in markets:
-            # DEBUG: Sample first 3 markets to log field types/values
-            if debug_markets and debug_samples_logged < 3:
+            # Always log first 3 markets BEFORE filtering to diagnose API schema
+            if samples_logged < 3:
+                market_id = m.get("id") or m.get("slug") or "unknown"
                 closed_val = m.get("closed")
+                active_val = m.get("active")
+                state_val = m.get("state")
+                status_val = m.get("status")
                 end_date_val = m.get("endDate")
-                volume_val = m.get("volume")
-                liquidity_val = m.get("liquidity")
                 print(
-                    f"[DEBUG_MARKETS] market[{debug_samples_logged}] "
-                    f"closed={closed_val!r} (type={type(closed_val).__name__}), "
-                    f"endDate={end_date_val!r} (type={type(end_date_val).__name__}), "
-                    f"volume={volume_val!r} (type={type(volume_val).__name__}), "
-                    f"liquidity={liquidity_val!r} (type={type(liquidity_val).__name__})"
+                    f"[market_sample] market[{samples_logged}] id={market_id} "
+                    f"closed={closed_val!r} (type={type(closed_val).__name__}) "
+                    f"active={active_val!r} state={state_val!r} status={status_val!r} "
+                    f"endDate={end_date_val!r} (type={type(end_date_val).__name__ if end_date_val else 'None'})"
                 )
-                debug_samples_logged += 1
+                samples_logged += 1
             
-            # Skip closed markets (robust parsing)
-            if to_bool(m.get("closed")):
+            # Determine if market is closed: check closed field, and also active/state/status
+            closed = to_bool(m.get("closed"))
+            # Also check if active is explicitly False (some APIs use this)
+            if not closed and m.get("active") is False:
+                closed = True
+            # Check state/status fields if they indicate closed
+            state = m.get("state", "").lower() if isinstance(m.get("state"), str) else ""
+            status = m.get("status", "").lower() if isinstance(m.get("status"), str) else ""
+            if state in {"closed", "resolved", "ended"} or status in {"closed", "resolved", "ended"}:
+                closed = True
+            
+            if closed:
                 filtered_closed += 1
                 continue
             
@@ -358,6 +368,7 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
     )
     
     # Safety valve: if filtering eliminated >99% of markets, disable filters
+    # (Relaxed: only trigger if ALL markets filtered, not 99%)
     if raw_markets_count > 0 and len(metas) == 0:
         print(
             f"[WARNING] All {raw_markets_count} markets filtered out! "
@@ -513,9 +524,15 @@ class MarketWatcher:
         self.heartbeat_sec = heartbeat_sec
         self._last_heartbeat = time.time()
         self._last_msg_ts = time.time()
+        self._last_pong_ts = time.time()  # Track pong responses (proves connection alive)
         self._idle_timeout_sec = 180  # Force reconnect if idle > 180s
         self._ws_connected = False
         self._ws_instance = None
+        
+        # Message observability
+        self._msg_count = 0
+        self._msg_timestamps: Deque[float] = deque(maxlen=60)  # Track last 60 seconds
+        self._last_message_type = "none"
 
         self.asset_ids = self._select_asset_ids()
 
@@ -814,6 +831,9 @@ class MarketWatcher:
             """Called when websocket connection is established."""
             self._ws_connected = True
             self._last_msg_ts = time.time()  # Reset on new connection
+            self._last_pong_ts = time.time()  # Reset pong tracking
+            self._msg_count = 0
+            self._msg_timestamps.clear()
             print("[ws] connected/open")
             # Wait a tiny bit to ensure connection is fully ready
             time.sleep(0.1)
@@ -822,16 +842,31 @@ class MarketWatcher:
             print(f"[ws] subscribed to {len(self.asset_ids)} tokens (market channel)")
 
         def on_message(ws, msg):
-            self._last_msg_ts = time.time()
+            """Called on ANY websocket message (including pings/pongs)."""
+            now = time.time()
+            self._last_msg_ts = now  # Update on ANY message (proves connection alive)
+            self._msg_timestamps.append(now)
+            
             try:
                 payload = json.loads(msg)
             except Exception:
+                # Non-JSON message (could be ping/pong frame, ignore)
                 return
 
             items = payload if isinstance(payload, list) else [payload]
 
-            # lightweight message-type counter (prints every 200 messages)
-            self._msg_count = getattr(self, "_msg_count", 0) + 1
+            # Track message types
+            self._msg_count += 1
+            for it in items:
+                if isinstance(it, dict):
+                    et = it.get("event_type", "unknown")
+                    self._last_message_type = et
+                    if et == "price_change":
+                        self._handle_price_change(it)
+                    elif et == "trade":
+                        self._handle_trade_event(it)
+            
+            # Log every 200 messages
             if self._msg_count % 200 == 0:
                 types = {}
                 for it in items:
@@ -840,14 +875,10 @@ class MarketWatcher:
                         types[t] = types.get(t, 0) + 1
                 print(f"[ws] msg_count={self._msg_count} recent_types={types}")
 
-            for p in items:
-                if not isinstance(p, dict):
-                    continue
-                et = p.get("event_type")
-                if et == "price_change":
-                    self._handle_price_change(p)
-                elif et == "trade":
-                    self._handle_trade_event(p)
+        def on_pong(ws, msg):
+            """Called when pong frame is received (proves connection is alive)."""
+            self._last_pong_ts = time.time()
+            self._last_msg_ts = time.time()  # Pong also proves connection alive
 
         def on_error(ws, err):
             print(f"[ws] error: {err}")
@@ -858,18 +889,34 @@ class MarketWatcher:
             self._ws_connected = False
 
         def check_idle_timeout():
-            """Background thread to check for idle timeout and force reconnect."""
+            """Background thread to check connection health and force reconnect only if dead."""
             while True:
                 time.sleep(30)  # Check every 30 seconds
                 if not self._ws_connected:
                     continue
                 
                 now = time.time()
-                idle_sec = int(now - self._last_msg_ts)
+                time_since_msg = now - self._last_msg_ts
+                time_since_pong = now - self._last_pong_ts
                 
-                # Force reconnect if idle > 180s
-                if idle_sec > self._idle_timeout_sec:
-                    print(f"[heartbeat] IDLE TIMEOUT: last message {idle_sec}s ago (>{self._idle_timeout_sec}s), forcing reconnect")
+                # Count messages in last minute
+                cutoff = now - 60
+                msgs_last_minute = sum(1 for ts in self._msg_timestamps if ts > cutoff)
+                
+                # Only force reconnect if connection is actually dead:
+                # - No pong for > 2 ping intervals (50s) AND no messages for > 180s
+                # - OR connection flag is False (error/close detected)
+                pong_timeout = 50  # 2 * ping_interval
+                connection_dead = (
+                    (time_since_pong > pong_timeout and time_since_msg > self._idle_timeout_sec) or
+                    not self._ws_connected
+                )
+                
+                if connection_dead:
+                    print(
+                        f"[heartbeat] CONNECTION DEAD: last_msg={int(time_since_msg)}s ago "
+                        f"last_pong={int(time_since_pong)}s ago, forcing reconnect"
+                    )
                     self._ws_connected = False
                     if self._ws_instance:
                         try:
@@ -877,7 +924,12 @@ class MarketWatcher:
                         except Exception:
                             pass
                 elif now - self._last_heartbeat >= self.heartbeat_sec:
-                    print(f"[heartbeat] running; last message {idle_sec}s ago; subscribed assets={len(self.asset_ids)}")
+                    # Regular heartbeat: connection is healthy
+                    print(
+                        f"[heartbeat] healthy: msgs_last_min={msgs_last_minute} "
+                        f"last_msg={int(time_since_msg)}s ago last_pong={int(time_since_pong)}s ago "
+                        f"last_type={self._last_message_type} assets={len(self.asset_ids)}"
+                    )
                     self._last_heartbeat = now
 
         # Start idle timeout checker thread
@@ -894,6 +946,7 @@ class MarketWatcher:
                     on_message=on_message,
                     on_error=on_error,
                     on_close=on_close,
+                    on_pong=on_pong,
                 )
                 # Cloudflare WS can silently die; pings help.
                 # Use ping_interval=25 (between 20-30s as requested)
