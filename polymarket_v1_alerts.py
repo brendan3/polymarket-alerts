@@ -19,6 +19,7 @@ import json
 import os
 import smtplib
 import sqlite3
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -211,6 +212,10 @@ class MarketMeta:
 
 def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) -> List[MarketMeta]:
     metas: List[MarketMeta] = []
+    now_ts = time.time()
+    filtered_closed = 0
+    filtered_enddate = 0
+    
     for p in range(pages):
         params = {"limit": per_page, "offset": p * per_page}
         if active_only:
@@ -218,6 +223,24 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
         r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
         r.raise_for_status()
         for m in r.json():
+            # Skip closed markets
+            if m.get("closed") is True:
+                filtered_closed += 1
+                continue
+            
+            # Skip markets with endDate in the past
+            end_date_str = m.get("endDate")
+            if end_date_str:
+                try:
+                    # Parse ISO format date string
+                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    if end_dt.timestamp() < now_ts:
+                        filtered_enddate += 1
+                        continue
+                except Exception:
+                    # If parsing fails, skip this check (don't filter)
+                    pass
+            
             raw_clob = m.get("clobTokenIds")
             clob_ids = coerce_clob_token_ids(raw_clob)
             if not clob_ids:
@@ -233,6 +256,9 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
                     clob_token_ids=clob_ids,
                 )
             )
+    
+    if filtered_closed > 0 or filtered_enddate > 0:
+        print(f"[market_filter] filtered_closed={filtered_closed} filtered_enddate={filtered_enddate}")
     
     # Defensive check for suspicious token IDs
     bad = [m for m in metas if any(len(tid) <= 2 for tid in m.clob_token_ids)]
@@ -348,6 +374,9 @@ class MarketWatcher:
         self.heartbeat_sec = heartbeat_sec
         self._last_heartbeat = time.time()
         self._last_msg_ts = time.time()
+        self._idle_timeout_sec = 180  # Force reconnect if idle > 180s
+        self._ws_connected = False
+        self._ws_instance = None
 
         self.asset_ids = self._select_asset_ids()
 
@@ -643,9 +672,15 @@ class MarketWatcher:
         backoff = 5
 
         def on_open(ws):
+            """Called when websocket connection is established."""
+            self._ws_connected = True
+            self._last_msg_ts = time.time()  # Reset on new connection
+            print("[ws] connected/open")
+            # Wait a tiny bit to ensure connection is fully ready
+            time.sleep(0.1)
             # Market channel subscription. This is the important part.
             ws.send(json.dumps({"type": "market", "assets_ids": self.asset_ids}))
-            print(f"Subscribed to {len(self.asset_ids)} tokens (market channel)")
+            print(f"[ws] subscribed to {len(self.asset_ids)} tokens (market channel)")
 
         def on_message(ws, msg):
             self._last_msg_ts = time.time()
@@ -677,13 +712,44 @@ class MarketWatcher:
 
         def on_error(ws, err):
             print(f"[ws] error: {err}")
+            self._ws_connected = False
 
         def on_close(ws, code, reason):
             print(f"[ws] closed: code={code} reason={reason}")
+            self._ws_connected = False
+
+        def check_idle_timeout():
+            """Background thread to check for idle timeout and force reconnect."""
+            while True:
+                time.sleep(30)  # Check every 30 seconds
+                if not self._ws_connected:
+                    continue
+                
+                now = time.time()
+                idle_sec = int(now - self._last_msg_ts)
+                
+                # Force reconnect if idle > 180s
+                if idle_sec > self._idle_timeout_sec:
+                    print(f"[heartbeat] IDLE TIMEOUT: last message {idle_sec}s ago (>{self._idle_timeout_sec}s), forcing reconnect")
+                    self._ws_connected = False
+                    if self._ws_instance:
+                        try:
+                            self._ws_instance.close()
+                        except Exception:
+                            pass
+                elif now - self._last_heartbeat >= self.heartbeat_sec:
+                    print(f"[heartbeat] running; last message {idle_sec}s ago; subscribed assets={len(self.asset_ids)}")
+                    self._last_heartbeat = now
+
+        # Start idle timeout checker thread
+        timeout_thread = threading.Thread(target=check_idle_timeout, daemon=True)
+        timeout_thread.start()
 
         while True:
             try:
-                ws = WebSocketApp(
+                # Create NEW websocket instance every reconnect
+                self._ws_connected = False
+                self._ws_instance = WebSocketApp(
                     f"{CLOB_WS_BASE}/ws/market",
                     on_open=on_open,
                     on_message=on_message,
@@ -691,19 +757,15 @@ class MarketWatcher:
                     on_close=on_close,
                 )
                 # Cloudflare WS can silently die; pings help.
-                ws.run_forever(ping_interval=30, ping_timeout=10)
+                # Use ping_interval=25 (between 20-30s as requested)
+                self._ws_instance.run_forever(ping_interval=25, ping_timeout=10)
             except Exception as e:
                 print(f"[ws] run_forever exception: {e}")
+                self._ws_connected = False
 
             print(f"[ws] reconnecting in {backoff}s...")
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
-
-            now = time.time()
-            if now - self._last_heartbeat >= self.heartbeat_sec:
-                idle = int(now - self._last_msg_ts)
-                print(f"[heartbeat] running; last message {idle}s ago; subscribed assets={len(self.asset_ids)}")
-                self._last_heartbeat = now
 
 
 # =========================
