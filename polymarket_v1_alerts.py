@@ -358,11 +358,15 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True, 
                 filtered_closed += 1
                 continue
 
-            # Skip archived/restricted (usually not useful for alerts)
+            # Skip archived (archived markets are not tradable)
             if to_bool(m.get("archived")):
                 filtered_archived += 1
                 continue
-            if to_bool(m.get("restricted")):
+            
+            # Skip restricted markets UNLESS in broad_test mode
+            # In broad_test, we want maximum coverage for testing alerts
+            # Restricted markets can still be monitored for price moves/trades
+            if not broad_test and to_bool(m.get("restricted")):
                 filtered_restricted += 1
                 continue
 
