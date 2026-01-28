@@ -280,154 +280,198 @@ class MarketMeta:
     liquidity: Optional[float]
     outcomes: List[str]
     clob_token_ids: List[str]
+    updated_at: Optional[str] = None  # For sorting by recency
+    created_at: Optional[str] = None
 
     def title(self) -> str:
         if self.event_title and self.event_title != self.market_question:
             return f"{self.event_title} — {self.market_question}"
         return self.market_question
+    
+    def updated_at_ts(self) -> float:
+        """Parse updatedAt to timestamp for sorting."""
+        if not self.updated_at:
+            return 0.0
+        try:
+            # Handle ISO format with or without Z
+            s = self.updated_at
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            elif "+" not in s and "T" in s:
+                s = s + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
 
 def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) -> Tuple[List[MarketMeta], int]:
     """
-    Fetch markets from Gamma API and filter by closed/endDate.
-    Returns (metas, raw_markets_count) for safety valve logic.
+    Fetch markets from Gamma API, sort by recency, and filter to live/tradable markets only.
+    
+    Strategy:
+    1. Fetch multiple pages to get a large pool
+    2. Sort locally by updatedAt desc (newest first)
+    3. Filter to only live/tradable markets (not closed/archived, endDate in future)
+    4. Return the filtered list
+    
+    Note: Gamma's "active=true" does NOT mean tradable - many closed markets have active=true.
+    We must filter by closed/archived/ready/funded/endDate explicitly.
+    
+    Returns (metas, raw_markets_count).
     """
-    metas: List[MarketMeta] = []
     now_ts = time.time()
-    filtered_closed = 0
-    filtered_enddate = 0
+    all_markets = []  # Accumulate all markets before filtering
     raw_markets_count = 0
     samples_logged = 0
     
+    # Step 1: Fetch all pages and accumulate markets
+    print(f"[market_fetch] Fetching {pages} pages ({per_page} per page)...")
     for p in range(pages):
         params = {"limit": per_page, "offset": p * per_page}
+        # Always request active=true (even if it's not reliable, it may help)
         if active_only:
             params["active"] = "true"
-        r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
-        r.raise_for_status()
-        markets = r.json()
-        raw_markets_count += len(markets)
-        
-        for m in markets:
-            # Always log first 3 markets BEFORE filtering to diagnose API schema
-            if samples_logged < 3:
-                market_id = m.get("id") or m.get("slug") or "unknown"
-                closed_val = m.get("closed")
-                active_val = m.get("active")
-                state_val = m.get("state")
-                status_val = m.get("status")
-                end_date_val = m.get("endDate")
-                print(
-                    f"[market_sample] market[{samples_logged}] id={market_id} "
-                    f"closed={closed_val!r} (type={type(closed_val).__name__}) "
-                    f"active={active_val!r} state={state_val!r} status={status_val!r} "
-                    f"endDate={end_date_val!r} (type={type(end_date_val).__name__ if end_date_val else 'None'})"
-                )
-                samples_logged += 1
-            
-            # Determine if market is closed: check closed field, and also active/state/status
-            closed = to_bool(m.get("closed"))
-            # Also check if active is explicitly False (some APIs use this)
-            if not closed and m.get("active") is False:
-                closed = True
-            # Check state/status fields if they indicate closed
-            state = m.get("state", "").lower() if isinstance(m.get("state"), str) else ""
-            status = m.get("status", "").lower() if isinstance(m.get("status"), str) else ""
-            if state in {"closed", "resolved", "ended"} or status in {"closed", "resolved", "ended"}:
-                closed = True
-            
-            if closed:
-                filtered_closed += 1
-                continue
-            
-            # Skip markets with endDate in the past (robust parsing)
-            # This is critical: old markets should never be subscribed to
-            end_date_ts = parse_end_date(m.get("endDate"), now_ts)
-            if end_date_ts is not None:
-                filtered_enddate += 1
-                # Log first few filtered markets for debugging
-                if filtered_enddate <= 3:
-                    market_id = m.get("id") or m.get("slug") or "unknown"
-                    end_date_str = m.get("endDate")
-                    print(
-                        f"[market_filter] Filtered endDate: id={market_id} "
-                        f"endDate={end_date_str!r} parsed_ts={end_date_ts} "
-                        f"age_days={(now_ts - end_date_ts) / 86400:.1f}"
-                    )
-                continue
-            
-            raw_clob = m.get("clobTokenIds")
-            clob_ids = coerce_clob_token_ids(raw_clob)
-            if not clob_ids:
-                continue
-            metas.append(
-                MarketMeta(
-                    market_question=m.get("question") or "Unknown",
-                    event_title=m.get("title") or "",
-                    event_slug=m.get("eventSlug"),
-                    volume=safe_float(m.get("volume")),
-                    liquidity=safe_float(m.get("liquidity")),
-                    outcomes=m.get("outcomes") or [],
-                    clob_token_ids=clob_ids,
-                )
-            )
-    
-    print(
-        f"[market_filter] raw_markets={raw_markets_count} "
-        f"filtered_closed={filtered_closed} filtered_enddate={filtered_enddate} "
-        f"remaining={len(metas)}"
-    )
-    
-    # Safety valve: if closed filter eliminated ALL markets, disable only closed filter
-    # BUT keep endDate filter active (old markets should still be filtered)
-    if raw_markets_count > 0 and len(metas) == 0 and filtered_closed == raw_markets_count:
-        print(
-            f"[WARNING] All {raw_markets_count} markets filtered as closed! "
-            f"Disabling closed filter as safety valve (keeping endDate filter active)."
-        )
-        # Re-fetch without closed filter, but KEEP endDate filter
-        metas = []
-        filtered_closed = 0
-        filtered_enddate = 0
-        for p in range(pages):
-            params = {"limit": per_page, "offset": p * per_page}
-            if active_only:
-                params["active"] = "true"
+        try:
             r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
             r.raise_for_status()
-            for m in r.json():
-                # Still filter by endDate (don't allow old markets)
-                end_date_ts = parse_end_date(m.get("endDate"), now_ts)
-                if end_date_ts is not None:
-                    filtered_enddate += 1
-                    continue
-                
-                raw_clob = m.get("clobTokenIds")
-                clob_ids = coerce_clob_token_ids(raw_clob)
-                if not clob_ids:
-                    continue
-                metas.append(
-                    MarketMeta(
-                        market_question=m.get("question") or "Unknown",
-                        event_title=m.get("title") or "",
-                        event_slug=m.get("eventSlug"),
-                        volume=safe_float(m.get("volume")),
-                        liquidity=safe_float(m.get("liquidity")),
-                        outcomes=m.get("outcomes") or [],
-                        clob_token_ids=clob_ids,
+            markets = r.json()
+            raw_markets_count += len(markets)
+            all_markets.extend(markets)
+            
+            # Log first 3 markets to diagnose schema
+            for m in markets[:3]:
+                if samples_logged < 3:
+                    market_id = m.get("id") or m.get("slug") or "unknown"
+                    closed_val = m.get("closed")
+                    archived_val = m.get("archived")
+                    ready_val = m.get("ready")
+                    funded_val = m.get("funded")
+                    active_val = m.get("active")
+                    end_date_val = m.get("endDate")
+                    updated_at = m.get("updatedAt")
+                    print(
+                        f"[market_sample] market[{samples_logged}] id={market_id} "
+                        f"closed={closed_val!r} archived={archived_val!r} ready={ready_val!r} "
+                        f"funded={funded_val!r} active={active_val!r} "
+                        f"endDate={end_date_val!r} updatedAt={updated_at!r}"
                     )
-                )
-        print(
-            f"[market_filter] Safety valve: {len(metas)} markets loaded "
-            f"(closed filter disabled, endDate filter active, filtered_enddate={filtered_enddate})"
-        )
-    elif raw_markets_count > 0:
-        filter_pct = 100.0 * (filtered_closed + filtered_enddate) / raw_markets_count
-        if filter_pct > 99.0:
-            print(
-                f"[WARNING] Filtering eliminated {filter_pct:.1f}% of markets "
-                f"({filtered_closed + filtered_enddate}/{raw_markets_count}). "
-                f"Consider reviewing filter logic."
+                    samples_logged += 1
+        except Exception as e:
+            print(f"[market_fetch] Error fetching page {p}: {e}")
+            continue
+    
+    print(f"[market_fetch] Fetched {raw_markets_count} total markets from {pages} pages")
+    
+    # Step 2: Sort by updatedAt desc (newest first)
+    # Markets without updatedAt go to the end
+    def sort_key(m: dict) -> float:
+        updated_at = m.get("updatedAt") or m.get("createdAt") or ""
+        if not updated_at:
+            return 0.0
+        try:
+            s = updated_at
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            elif "+" not in s and "T" in s:
+                s = s + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
+    
+    all_markets.sort(key=sort_key, reverse=True)
+    
+    # Log date range
+    if all_markets:
+        newest_ts = sort_key(all_markets[0])
+        oldest_ts = sort_key(all_markets[-1])
+        newest_str = datetime.fromtimestamp(newest_ts, tz=timezone.utc).isoformat() if newest_ts > 0 else "unknown"
+        oldest_str = datetime.fromtimestamp(oldest_ts, tz=timezone.utc).isoformat() if oldest_ts > 0 else "unknown"
+        print(f"[market_fetch] Date range: newest={newest_str} oldest={oldest_str}")
+    
+    # Step 3: Filter to live/tradable markets only
+    metas: List[MarketMeta] = []
+    filtered_closed = 0
+    filtered_archived = 0
+    filtered_ready = 0
+    filtered_funded = 0
+    filtered_enddate = 0
+    
+    for m in all_markets:
+        # Hard filter: closed markets are NOT tradable
+        if to_bool(m.get("closed")):
+            filtered_closed += 1
+            continue
+        
+        # Hard filter: archived markets are NOT tradable
+        if to_bool(m.get("archived")):
+            filtered_archived += 1
+            continue
+        
+        # Hard filter: markets that are not ready are NOT tradable
+        if m.get("ready") is False:
+            filtered_ready += 1
+            continue
+        
+        # Hard filter: markets that are not funded may not be tradable
+        if m.get("funded") is False:
+            filtered_funded += 1
+            continue
+        
+        # Hard filter: markets with endDate in the past are NOT tradable
+        end_date_ts = parse_end_date(m.get("endDate"), now_ts)
+        if end_date_ts is not None:
+            filtered_enddate += 1
+            continue
+        
+        # Must have clobTokenIds to subscribe
+        raw_clob = m.get("clobTokenIds")
+        clob_ids = coerce_clob_token_ids(raw_clob)
+        if not clob_ids:
+            continue
+        
+        # Market passed all filters - it's live/tradable
+        metas.append(
+            MarketMeta(
+                market_question=m.get("question") or "Unknown",
+                event_title=m.get("title") or "",
+                event_slug=m.get("eventSlug"),
+                volume=safe_float(m.get("volume")),
+                liquidity=safe_float(m.get("liquidity")),
+                outcomes=m.get("outcomes") or [],
+                clob_token_ids=clob_ids,
+                updated_at=m.get("updatedAt"),
+                created_at=m.get("createdAt"),
             )
+        )
+    
+    # Log filtering results
+    print(
+        f"[market_filter] raw_markets={raw_markets_count} "
+        f"filtered_closed={filtered_closed} filtered_archived={filtered_archived} "
+        f"filtered_ready={filtered_ready} filtered_funded={filtered_funded} "
+        f"filtered_enddate={filtered_enddate} remaining={len(metas)}"
+    )
+    
+    # Log date range of final markets
+    if metas:
+        updated_times = [m.updated_at_ts() for m in metas if m.updated_at_ts() > 0]
+        if updated_times:
+            newest_ts = max(updated_times)
+            oldest_ts = min(updated_times)
+            newest_str = datetime.fromtimestamp(newest_ts, tz=timezone.utc).isoformat()
+            oldest_str = datetime.fromtimestamp(oldest_ts, tz=timezone.utc).isoformat()
+            print(f"[market_filter] Final markets date range: newest={newest_str} oldest={oldest_str}")
+    
+    # No safety valve - if we filter everything out, that means there are no live markets
+    # This is correct behavior (better than subscribing to dead markets)
+    if raw_markets_count > 0 and len(metas) == 0:
+        print(
+            f"[WARNING] All {raw_markets_count} markets filtered out! "
+            f"No live/tradable markets found. This may indicate: "
+            f"1) API returned only old/closed markets, or "
+            f"2) Need to fetch more pages to find active markets."
+        )
     
     # Defensive check for suspicious token IDs
     bad = [m for m in metas if any(len(tid) <= 2 for tid in m.clob_token_ids)]
@@ -985,7 +1029,15 @@ class MarketWatcher:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Polymarket alerts worker (price moves & whale trades)")
-    ap.add_argument("--gamma-active", action="store_true", help="Filter Gamma markets to active=true.")
+    # Note: --gamma-active requests active=true from API, but this is NOT reliable.
+    # We still filter by closed/archived/ready/funded/endDate explicitly.
+    # Default to True (always request active=true), Railway command also includes --gamma-active explicitly.
+    ap.add_argument("--gamma-active", action="store_true", 
+                     help="Request active=true from Gamma API (default: True, but not reliable - we filter explicitly).")
+    ap.add_argument("--no-gamma-active", dest="gamma_active", action="store_false",
+                     help="Disable active=true API parameter.")
+    # Set default after adding both arguments
+    ap.set_defaults(gamma_active=True)
     ap.add_argument("--pages", type=int, default=5, help="Number of pages of markets to fetch from Gamma.")
     ap.add_argument("--per-page", type=int, default=100, help="Markets per page.")
     ap.add_argument("--window-min", type=int, default=10, help="Window size (minutes) for price move detection.")
@@ -994,6 +1046,8 @@ def main() -> None:
     ap.add_argument("--min-liquidity", type=float, default=100_000, help="Minimum market liquidity.")
     ap.add_argument("--max-spread", type=float, default=0.06, help="Max bid-ask spread allowed (absolute).")
     ap.add_argument("--max-assets", type=int, default=500, help="Max number of assets to subscribe to.")
+    ap.add_argument("--broad-test", action="store_true", 
+                     help="Broad testing mode: relaxes min-volume/min-liquidity to 0, increases max-assets to 1000.")
     ap.add_argument("--whale-threshold", type=float, default=0.0, help="Notional USD threshold to trigger whale alerts.")
     ap.add_argument("--whale-cooldown", type=int, default=300, help="Cooldown per asset for whale alerts (seconds).")
     ap.add_argument("--db-path", type=str, default="data/alerts.db", help="SQLite DB path.")
@@ -1002,6 +1056,20 @@ def main() -> None:
     ap.add_argument("--heartbeat-sec", type=int, default=60, help="Heartbeat interval (seconds).")
 
     args = ap.parse_args()
+
+    # Apply --broad-test mode: relax thresholds for testing
+    min_volume = args.min_volume
+    min_liquidity = args.min_liquidity
+    max_assets = args.max_assets
+    
+    if args.broad_test:
+        print("[config] BROAD-TEST mode enabled: relaxing thresholds")
+        min_volume = 0
+        min_liquidity = 0
+        max_assets = 1000
+        print(f"[config] Override: min_volume={min_volume} min_liquidity={min_liquidity} max_assets={max_assets}")
+    else:
+        print(f"[config] Normal mode: min_volume={min_volume} min_liquidity={min_liquidity} max_assets={max_assets}")
 
     # Retry loop with backoff if no assets selected
     backoff_sec = 60
@@ -1018,10 +1086,10 @@ def main() -> None:
             metas,
             window_min=args.window_min,
             move_pct=args.move_pct,
-            min_volume=args.min_volume,
-            min_liquidity=args.min_liquidity,
+            min_volume=min_volume,
+            min_liquidity=min_liquidity,
             max_spread=args.max_spread,
-            max_assets=args.max_assets,
+            max_assets=max_assets,
             whale_threshold=args.whale_threshold,
             whale_cooldown_sec=args.whale_cooldown,
             email=args.email,
