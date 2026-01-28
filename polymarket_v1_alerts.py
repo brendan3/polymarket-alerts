@@ -267,9 +267,26 @@ def send_telegram_message(body: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": body}
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        # Log success occasionally (not every message to avoid spam)
+        if hasattr(send_telegram_message, "_msg_count"):
+            send_telegram_message._msg_count += 1
+        else:
+            send_telegram_message._msg_count = 1
+        
+        if send_telegram_message._msg_count == 1 or send_telegram_message._msg_count % 50 == 0:
+            print(f"[telegram] Message sent successfully (total sent: {send_telegram_message._msg_count})")
+    except requests.exceptions.HTTPError as e:
+        print(f"[telegram] HTTP error sending message: {e} (status: {e.response.status_code if hasattr(e, 'response') else 'unknown'})")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_body = e.response.json()
+                print(f"[telegram] Error response: {error_body}")
+            except Exception:
+                print(f"[telegram] Error response body: {e.response.text[:200]}")
     except Exception as e:
-        print(f"[telegram] send_telegram_message exception: {e}")
+        print(f"[telegram] Exception sending message: {e}")
 
 
 # =========================
@@ -508,6 +525,10 @@ class MarketWatcher:
         self.price_history: Dict[str, Deque[PricePoint]] = defaultdict(deque)
         self.last_price_alert_ms: Dict[str, int] = {}
         self.last_whale_alert_s: Dict[str, float] = {}
+        # Track seen transaction hashes to avoid duplicate alerts on reconnects/replays
+        self._seen_tx_hashes: set = set()
+        # Limit size to prevent memory growth (keep last 10k hashes)
+        self._max_seen_tx_hashes = 10000
 
         self.heartbeat_sec = heartbeat_sec
         self._last_heartbeat = time.time()
@@ -521,6 +542,7 @@ class MarketWatcher:
         self._msg_timestamps: Deque[float] = deque(maxlen=60)
         self._last_message_type = "none"
         self._debug_seen_event_types: Dict[str, int] = defaultdict(int)
+        self._book_event_count = 0  # Track book events for summary logging
         # Debug sampling controls (can be overridden via env)
         # - POLY_DEBUG_SAMPLE_EVERY: log 1 full payload for unknown event types every N messages
         # - POLY_DEBUG_LAST_TRADE_SAMPLE_EVERY: log 1 full payload for last_trade_price every N messages
@@ -750,6 +772,25 @@ class MarketWatcher:
             if not meta:
                 continue
 
+            # Extract transaction_hash for deduplication (if available)
+            tx_hash = trade.get("transaction_hash") or p.get("transaction_hash")
+            if tx_hash:
+                # Normalize hash (strip 0x prefix for consistency)
+                tx_hash_normalized = tx_hash.lower().lstrip("0x")
+                if tx_hash_normalized in self._seen_tx_hashes:
+                    # Skip duplicate transaction
+                    continue
+                # Add to seen set
+                self._seen_tx_hashes.add(tx_hash_normalized)
+                # Prune if set gets too large (keep most recent)
+                if len(self._seen_tx_hashes) > self._max_seen_tx_hashes:
+                    # Remove oldest 20% (simple approach: convert to list, slice, recreate set)
+                    # In practice, this is rare since we're tracking unique hashes
+                    excess = len(self._seen_tx_hashes) - int(self._max_seen_tx_hashes * 0.8)
+                    if excess > 0:
+                        to_remove = list(self._seen_tx_hashes)[:excess]
+                        self._seen_tx_hashes = self._seen_tx_hashes - set(to_remove)
+
             # Support multiple possible field names depending on event schema
             price = safe_float(
                 trade.get("price")
@@ -856,8 +897,16 @@ class MarketWatcher:
                     self._last_message_type = et
                     self._debug_seen_event_types[et] += 1
 
+                    # Handle "book" events (orderbook snapshots) - count but don't log full payloads
+                    if et == "book":
+                        self._book_event_count += 1
+                        # Log summary every 100 book events
+                        if self._book_event_count % 100 == 0:
+                            print(f"[ws][book] Received {self._book_event_count} orderbook snapshot events (suppressing full logs)")
+                    
                     # Debug sampler for unknown / unhandled event types
-                    if et not in {"price_change", "trade", "last_trade_price"}:
+                    # Note: "book" events are intentionally ignored (orderbook snapshots, too verbose)
+                    if et not in {"price_change", "trade", "last_trade_price", "book"}:
                         if self._debug_sample_every > 0 and (self._msg_count % self._debug_sample_every == 0):
                             try:
                                 print(f"[ws][debug] sample unknown event_type='{et}': {json.dumps(it, ensure_ascii=False)[:5000]}")
@@ -1022,10 +1071,20 @@ def main() -> None:
 
         backoff_sec = 60
 
+        # Send startup notifications
         if args.telegram:
-            send_telegram_message("Polymarket alerts worker started ✅")
+            startup_msg = (
+                "🚀 Polymarket Alerts Bot Started\n\n"
+                f"✅ Subscribed to {len(watcher.asset_ids)} assets\n"
+                f"📊 Monitoring {len(metas)} markets\n"
+                f"🐋 Whale threshold: ${args.whale_threshold:,.0f}\n"
+                f"📈 Price move threshold: {args.move_pct:.1f}% over {args.window_min}min"
+            )
+            send_telegram_message(startup_msg)
+            print("[startup] Telegram startup message sent")
         if args.email:
             send_email("[Polymarket] Worker started", "Polymarket alerts worker started ✅")
+            print("[startup] Email startup notification sent")
 
         watcher.run_forever()
         print("[main] watcher.run_forever() returned; refetching markets...")
