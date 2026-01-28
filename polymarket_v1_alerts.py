@@ -312,6 +312,9 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True, 
 
     filtered_closed = 0
     filtered_archived = 0
+    # NOTE: We no longer filter on `restricted`, but we keep this counter for
+    # backwards-compatible logging (it will always remain 0).
+    filtered_restricted = 0
     filtered_enddate = 0
     filtered_missing_tokens = 0
 
