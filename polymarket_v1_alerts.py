@@ -520,6 +520,12 @@ class MarketWatcher:
         self._msg_count = 0
         self._msg_timestamps: Deque[float] = deque(maxlen=60)
         self._last_message_type = "none"
+        self._debug_seen_event_types: Dict[str, int] = defaultdict(int)
+        # Debug sampling controls (can be overridden via env)
+        # - POLY_DEBUG_SAMPLE_EVERY: log 1 full payload for unknown event types every N messages
+        # - POLY_DEBUG_LAST_TRADE_SAMPLE_EVERY: log 1 full payload for last_trade_price every N messages
+        self._debug_sample_every = int(os.getenv("POLY_DEBUG_SAMPLE_EVERY") or "500")
+        self._debug_last_trade_sample_every = int(os.getenv("POLY_DEBUG_LAST_TRADE_SAMPLE_EVERY") or "50")
 
         self.asset_ids = self._select_asset_ids(broad_test=broad_test)
 
@@ -723,14 +729,40 @@ class MarketWatcher:
         ws_market_id = p.get("market", "")
         ts = int(p.get("timestamp") or now_ms())
 
-        for trade in p.get("trades", []) or []:
+        # trade-like payloads can appear as:
+        # - {"trades": [...]}                 (event_type="trade")
+        # - {"trades": {...}}                 (sometimes a single object)
+        # - {...single trade fields...}       (event_type="last_trade_price" or similar)
+        raw_trades = p.get("trades")
+        trades: List[dict] = []
+        if isinstance(raw_trades, list):
+            trades = [t for t in raw_trades if isinstance(t, dict)]
+        elif isinstance(raw_trades, dict):
+            trades = [raw_trades]
+        else:
+            # If payload itself looks trade-like, treat it as a single trade object.
+            if any(k in p for k in ("asset_id", "price", "last_trade_price", "qty", "size", "amount")):
+                trades = [p]
+
+        for trade in trades:
             aid = normalize_token_id(trade.get("asset_id", ""))
             meta = self.asset_to_meta.get(aid)
             if not meta:
                 continue
 
-            price = safe_float(trade.get("price"))
-            qty = safe_float(trade.get("qty") or trade.get("size"))
+            # Support multiple possible field names depending on event schema
+            price = safe_float(
+                trade.get("price")
+                or trade.get("last_trade_price")
+                or trade.get("trade_price")
+                or trade.get("fill_price")
+            )
+            qty = safe_float(
+                trade.get("qty")
+                or trade.get("size")
+                or trade.get("amount")
+                or trade.get("volume")
+            )
             if price is None or qty is None:
                 continue
 
@@ -822,9 +854,27 @@ class MarketWatcher:
                 if isinstance(it, dict):
                     et = it.get("event_type", "unknown")
                     self._last_message_type = et
+                    self._debug_seen_event_types[et] += 1
+
+                    # Debug sampler for unknown / unhandled event types
+                    if et not in {"price_change", "trade", "last_trade_price"}:
+                        if self._debug_sample_every > 0 and (self._msg_count % self._debug_sample_every == 0):
+                            try:
+                                print(f"[ws][debug] sample unknown event_type='{et}': {json.dumps(it, ensure_ascii=False)[:5000]}")
+                            except Exception:
+                                pass
+
+                    # Always sample last_trade_price occasionally so we can map schema
+                    if et == "last_trade_price":
+                        if self._debug_last_trade_sample_every > 0 and (self._debug_seen_event_types[et] % self._debug_last_trade_sample_every == 1):
+                            try:
+                                print(f"[ws][debug] sample last_trade_price payload: {json.dumps(it, ensure_ascii=False)[:8000]}")
+                            except Exception:
+                                pass
+
                     if et == "price_change":
                         self._handle_price_change(it)
-                    elif et == "trade":
+                    elif et in {"trade", "last_trade_price"}:
                         self._handle_trade_event(it)
 
         def on_pong(ws, msg):
@@ -922,6 +972,12 @@ def main() -> None:
         if args.max_assets < 1000:
             args.max_assets = 1000
         print(f"[config] Override: min_volume={args.min_volume:g} min_liquidity={args.min_liquidity:g} max_assets={args.max_assets}")
+
+    # Always log whale config so we don't accidentally run with whale alerts disabled.
+    print(
+        "[config] Whale alerts: threshold=$%s cooldown=%ss"
+        % (f"{args.whale_threshold:,.0f}" if args.whale_threshold is not None else "0", args.whale_cooldown)
+    )
 
     backoff_sec = 60
     max_backoff = 600
