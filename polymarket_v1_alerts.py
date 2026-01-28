@@ -309,13 +309,13 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
     Fetch markets from Gamma API, sort by recency, and filter to live/tradable markets only.
     
     Strategy:
-    1. Fetch multiple pages to get a large pool
+    1. Fetch multiple pages with server-side closed=false filter
     2. Sort locally by updatedAt desc (newest first)
     3. Filter to only live/tradable markets (not closed/archived, endDate in future)
     4. Return the filtered list
     
     Note: Gamma's "active=true" does NOT mean tradable - many closed markets have active=true.
-    We must filter by closed/archived/ready/funded/endDate explicitly.
+    We use server-side closed=false filter AND client-side filtering by closed/archived/ready/funded/endDate.
     
     Returns (metas, raw_markets_count).
     """
@@ -324,21 +324,40 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
     raw_markets_count = 0
     samples_logged = 0
     
-    # Step 1: Fetch all pages and accumulate markets
-    print(f"[market_fetch] Fetching {pages} pages ({per_page} per page)...")
+    # Step 1: Fetch all pages with server-side closed=false filter
+    print(f"[market_fetch] Fetching {pages} pages ({per_page} per page) with closed=false filter...")
     for p in range(pages):
-        params = {"limit": per_page, "offset": p * per_page}
-        # Always request active=true (even if it's not reliable, it may help)
+        params = {
+            "limit": per_page,
+            "offset": p * per_page,
+            "closed": "false"  # CRITICAL: Server-side filter for open markets only
+        }
+        # Optional: also request active=true (may help, but not reliable alone)
         if active_only:
             params["active"] = "true"
+        
+        # Log exact URL params for verification (first page only)
+        if p == 0:
+            url = f"{GAMMA_BASE}/markets"
+            param_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            print(f"[market_fetch] URL params (first page): {param_str}")
+            print(f"[market_fetch] Full URL: {url}?{param_str}")
+        
         try:
             r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
             r.raise_for_status()
             markets = r.json()
             raw_markets_count += len(markets)
+            
+            # Count closed=false vs closed=true in this batch (sample check)
+            closed_false_count = sum(1 for m in markets if m.get("closed") is False)
+            closed_true_count = sum(1 for m in markets if m.get("closed") is True)
+            if p == 0:  # Log for first page
+                print(f"[market_fetch] Page 0: closed=false={closed_false_count} closed=true={closed_true_count} total={len(markets)}")
+            
             all_markets.extend(markets)
             
-            # Log first 3 markets to diagnose schema
+            # Log first 3 markets AFTER server-side filters (to verify closed=false worked)
             for m in markets[:3]:
                 if samples_logged < 3:
                     market_id = m.get("id") or m.get("slug") or "unknown"
@@ -463,15 +482,93 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
             oldest_str = datetime.fromtimestamp(oldest_ts, tz=timezone.utc).isoformat()
             print(f"[market_filter] Final markets date range: newest={newest_str} oldest={oldest_str}")
     
-    # No safety valve - if we filter everything out, that means there are no live markets
-    # This is correct behavior (better than subscribing to dead markets)
+    # Safety valve: if no markets after filtering, retry with more pages (but keep closed=false)
+    # DO NOT disable closed filter - that would reintroduce old markets
     if raw_markets_count > 0 and len(metas) == 0:
         print(
-            f"[WARNING] All {raw_markets_count} markets filtered out! "
-            f"No live/tradable markets found. This may indicate: "
-            f"1) API returned only old/closed markets, or "
-            f"2) Need to fetch more pages to find active markets."
+            f"[WARNING] All {raw_markets_count} markets filtered out after server-side closed=false! "
+            f"Retrying with more pages (keeping closed=false filter)..."
         )
+        # Retry with 2x pages, still using closed=false
+        retry_pages = pages * 2
+        print(f"[market_fetch] Retry: Fetching {retry_pages} pages with closed=false...")
+        all_markets_retry = []
+        raw_markets_count_retry = 0
+        
+        for p in range(retry_pages):
+            params = {
+                "limit": per_page,
+                "offset": p * per_page,
+                "closed": "false"  # Keep closed=false filter
+            }
+            if active_only:
+                params["active"] = "true"
+            
+            try:
+                r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
+                r.raise_for_status()
+                markets = r.json()
+                raw_markets_count_retry += len(markets)
+                all_markets_retry.extend(markets)
+            except Exception as e:
+                print(f"[market_fetch] Error fetching retry page {p}: {e}")
+                continue
+        
+        print(f"[market_fetch] Retry fetched {raw_markets_count_retry} total markets")
+        
+        # Sort and filter retry markets
+        all_markets_retry.sort(key=sort_key, reverse=True)
+        
+        # Re-filter with same criteria
+        metas = []
+        filtered_closed = 0
+        filtered_archived = 0
+        filtered_ready = 0
+        filtered_funded = 0
+        filtered_enddate = 0
+        
+        for m in all_markets_retry:
+            if to_bool(m.get("closed")):
+                filtered_closed += 1
+                continue
+            if to_bool(m.get("archived")):
+                filtered_archived += 1
+                continue
+            if m.get("ready") is False:
+                filtered_ready += 1
+                continue
+            if m.get("funded") is False:
+                filtered_funded += 1
+                continue
+            end_date_ts = parse_end_date(m.get("endDate"), now_ts)
+            if end_date_ts is not None:
+                filtered_enddate += 1
+                continue
+            raw_clob = m.get("clobTokenIds")
+            clob_ids = coerce_clob_token_ids(raw_clob)
+            if not clob_ids:
+                continue
+            metas.append(
+                MarketMeta(
+                    market_question=m.get("question") or "Unknown",
+                    event_title=m.get("title") or "",
+                    event_slug=m.get("eventSlug"),
+                    volume=safe_float(m.get("volume")),
+                    liquidity=safe_float(m.get("liquidity")),
+                    outcomes=m.get("outcomes") or [],
+                    clob_token_ids=clob_ids,
+                    updated_at=m.get("updatedAt"),
+                    created_at=m.get("createdAt"),
+                )
+            )
+        
+        print(
+            f"[market_filter] Retry results: raw_markets={raw_markets_count_retry} "
+            f"filtered_closed={filtered_closed} filtered_archived={filtered_archived} "
+            f"filtered_ready={filtered_ready} filtered_funded={filtered_funded} "
+            f"filtered_enddate={filtered_enddate} remaining={len(metas)}"
+        )
+        raw_markets_count = raw_markets_count_retry  # Update for return value
     
     # Defensive check for suspicious token IDs
     bad = [m for m in metas if any(len(tid) <= 2 for tid in m.clob_token_ids)]
@@ -1070,6 +1167,28 @@ def main() -> None:
         print(f"[config] Override: min_volume={min_volume} min_liquidity={min_liquidity} max_assets={max_assets}")
     else:
         print(f"[config] Normal mode: min_volume={min_volume} min_liquidity={min_liquidity} max_assets={max_assets}")
+
+    # One-time startup verification: test closed=false API parameter
+    print("[startup] Verifying Gamma API closed=false parameter...")
+    try:
+        test_params = {"limit": 3, "offset": 0, "closed": "false"}
+        if args.gamma_active:
+            test_params["active"] = "true"
+        test_url = f"{GAMMA_BASE}/markets"
+        param_str = "&".join(f"{k}={v}" for k, v in sorted(test_params.items()))
+        print(f"[startup] Test URL: {test_url}?{param_str}")
+        test_r = requests.get(test_url, params=test_params, timeout=10)
+        test_r.raise_for_status()
+        test_markets = test_r.json()
+        closed_false_count = sum(1 for m in test_markets if m.get("closed") is False)
+        closed_true_count = sum(1 for m in test_markets if m.get("closed") is True)
+        print(f"[startup] Verification: received {len(test_markets)} markets, closed=false={closed_false_count} closed=true={closed_true_count}")
+        if closed_false_count == 0 and len(test_markets) > 0:
+            print("[startup] WARNING: All test markets have closed=true! API may not be filtering correctly.")
+        elif closed_false_count > 0:
+            print(f"[startup] ✅ Verification passed: received {closed_false_count} open markets")
+    except Exception as e:
+        print(f"[startup] Verification test failed: {e} (continuing anyway)")
 
     # Retry loop with backoff if no assets selected
     backoff_sec = 60
