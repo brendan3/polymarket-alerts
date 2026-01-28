@@ -340,9 +340,19 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
                 continue
             
             # Skip markets with endDate in the past (robust parsing)
+            # This is critical: old markets should never be subscribed to
             end_date_ts = parse_end_date(m.get("endDate"), now_ts)
             if end_date_ts is not None:
                 filtered_enddate += 1
+                # Log first few filtered markets for debugging
+                if filtered_enddate <= 3:
+                    market_id = m.get("id") or m.get("slug") or "unknown"
+                    end_date_str = m.get("endDate")
+                    print(
+                        f"[market_filter] Filtered endDate: id={market_id} "
+                        f"endDate={end_date_str!r} parsed_ts={end_date_ts} "
+                        f"age_days={(now_ts - end_date_ts) / 86400:.1f}"
+                    )
                 continue
             
             raw_clob = m.get("clobTokenIds")
@@ -367,14 +377,14 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
         f"remaining={len(metas)}"
     )
     
-    # Safety valve: if filtering eliminated >99% of markets, disable filters
-    # (Relaxed: only trigger if ALL markets filtered, not 99%)
-    if raw_markets_count > 0 and len(metas) == 0:
+    # Safety valve: if closed filter eliminated ALL markets, disable only closed filter
+    # BUT keep endDate filter active (old markets should still be filtered)
+    if raw_markets_count > 0 and len(metas) == 0 and filtered_closed == raw_markets_count:
         print(
-            f"[WARNING] All {raw_markets_count} markets filtered out! "
-            f"Disabling closed/endDate filters as safety valve."
+            f"[WARNING] All {raw_markets_count} markets filtered as closed! "
+            f"Disabling closed filter as safety valve (keeping endDate filter active)."
         )
-        # Re-fetch without closed/endDate filters
+        # Re-fetch without closed filter, but KEEP endDate filter
         metas = []
         filtered_closed = 0
         filtered_enddate = 0
@@ -385,6 +395,12 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
             r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
             r.raise_for_status()
             for m in r.json():
+                # Still filter by endDate (don't allow old markets)
+                end_date_ts = parse_end_date(m.get("endDate"), now_ts)
+                if end_date_ts is not None:
+                    filtered_enddate += 1
+                    continue
+                
                 raw_clob = m.get("clobTokenIds")
                 clob_ids = coerce_clob_token_ids(raw_clob)
                 if not clob_ids:
@@ -400,7 +416,10 @@ def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) 
                         clob_token_ids=clob_ids,
                     )
                 )
-        print(f"[market_filter] Safety valve: {len(metas)} markets loaded (filters disabled)")
+        print(
+            f"[market_filter] Safety valve: {len(metas)} markets loaded "
+            f"(closed filter disabled, endDate filter active, filtered_enddate={filtered_enddate})"
+        )
     elif raw_markets_count > 0:
         filter_pct = 100.0 * (filtered_closed + filtered_enddate) / raw_markets_count
         if filter_pct > 99.0:
