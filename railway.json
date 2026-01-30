@@ -4,7 +4,7 @@
       "builder": "NIXPACKS"
     },
     "deploy": {
-      "startCommand": "python3 polymarket_v1_alerts.py --gamma-active --broad-test --pages 40 --per-page 100 --whale-threshold 20000  --telegram",
+      "startCommand": "python3 polymarket_v1_alerts_updated.py --gamma-active --broad-test --pages 40 --per-page 100 --whale-threshold 20000  --telegram",
       "restartPolicyType": "ALWAYS"
     }
   }
