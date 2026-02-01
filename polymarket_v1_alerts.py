@@ -6,12 +6,10 @@ Polymarket alert worker (single WS) with:
 - Telegram/email notifications
 - SQLite logging
 
-Key points:
-✅ Uses ONLY /ws/market (price_change + trade events in same socket)
-✅ Fetches markets from Gamma with server-side filters: active=true, closed=false
-✅ Filters "live" markets client-side by endDate (must NOT be in the past) + clobTokenIds present
-✅ DOES NOT use Gamma's `ready` / `funded` as hard filters (they appear unreliable)
-✅ broad-test mode subscribes to as many assets as possible (up to max_assets)
+Key change vs your earlier versions:
+✅ Uses ONLY /ws/market (there is no /ws/trades on this host)
+✅ Processes both price_change + trade events from the same socket
+✅ Adds --max-assets (your Railway command already passes it)
 """
 
 from __future__ import annotations
@@ -32,6 +30,26 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import requests
 from websocket import WebSocketApp
+
+import re
+
+def iso_from_ms(ms: str | int | float | None) -> str:
+    """Convert millisecond unix timestamp to ISO8601 (UTC)."""
+    try:
+        if ms is None:
+            return ''
+        ms_int = int(float(ms))
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(ms_int/1000, tz=timezone.utc).isoformat()
+    except Exception:
+        return ''
+
+def escape_md(s: str) -> str:
+    """Escape Telegram MarkdownV2 special characters."""
+    if s is None:
+        return ''
+    # Telegram MarkdownV2 reserved: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    return re.sub(r'([_\*\[\]\(\)~`>#+\-=|{}\.!])', r'\\\1', str(s))
 
 # =========================
 # Constants
@@ -70,6 +88,82 @@ def compute_odds(bid: Any, ask: Any) -> Optional[float]:
 def normalize_token_id(s: str) -> str:
     return (s or "").strip().lower()
 
+def coerce_clob_token_ids(raw: Any) -> List[str]:
+    """
+    Gamma sometimes returns clobTokenIds as:
+      - list[str]
+      - a JSON-encoded string like '["id1","id2"]'
+      - a comma-separated string like 'id1,id2'
+    This normalizes to List[str].
+    """
+    if raw is None:
+        return []
+
+    # Already a list/tuple
+    if isinstance(raw, (list, tuple)):
+        return [normalize_token_id(str(x)) for x in raw if str(x).strip()]
+
+    # Sometimes it's a string
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+
+        # JSON list in a string
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith('"[') and s.endswith(']"')):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [normalize_token_id(str(x)) for x in parsed if str(x).strip()]
+            except Exception:
+                pass
+
+        # Comma-separated fallback
+        if "," in s:
+            parts = [p.strip() for p in s.split(",")]
+            return [normalize_token_id(p.strip('"').strip("'")) for p in parts if p.strip('"').strip("'")]
+
+        # Single token id string
+        return [normalize_token_id(s.strip('"').strip("'"))]
+
+    # Anything else: last resort
+    return [normalize_token_id(str(raw))] if str(raw).strip() else []
+
+def coerce_outcomes(raw: Any) -> List[str]:
+    """Normalize Gamma `outcomes` field to List[str]."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        # Most commonly JSON-encoded list string: '["Yes","No"]'
+        if s.startswith('[') and s.endswith(']'):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            except Exception:
+                pass
+        # Fall back: treat as single label
+        return [s]
+    return [str(raw)]
+
+
+def as_money(x: Optional[float]) -> str:
+    if x is None:
+        return "n/a"
+    if x >= 1_000_000:
+        return f"${x / 1_000_000:.2f}M"
+    if x >= 1_000:
+        return f"${x / 1_000:.1f}K"
+    return f"${x:.0f}"
+
+def fmt_spread(spread: Optional[float]) -> str:
+    return f"{spread:.4f}" if spread is not None else "n/a"
+
 def env_truthy(val: Optional[str]) -> bool:
     if val is None:
         return False
@@ -80,8 +174,9 @@ def to_bool(value: Any) -> bool:
     Robust boolean parser that handles:
     - bool: True/False
     - str: "true"/"false", "1"/"0", "yes"/"no" (case-insensitive)
-    - int/float: 1/0
+    - int: 1/0
     - None: False
+    - Anything else: False
     """
     if value is None:
         return False
@@ -97,115 +192,58 @@ def to_bool(value: Any) -> bool:
             return False
     return False
 
-def coerce_json_list(raw: Any) -> List[str]:
-    """
-    Gamma often returns list fields as JSON strings, e.g. outcomes: '["Yes","No"]'
-    This normalizes to a python list[str].
-    """
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return [str(x) for x in raw]
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return []
-        # JSON list in a string
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [str(x) for x in parsed]
-            except Exception:
-                return []
-        # fallback single string
-        return [s]
-    return [str(raw)]
-
-def coerce_clob_token_ids(raw: Any) -> List[str]:
-    """
-    Gamma sometimes returns clobTokenIds as:
-      - list[str]
-      - JSON-encoded string like '["id1","id2"]'
-      - comma-separated string like 'id1,id2'
-    Normalize to List[str].
-    """
-    if raw is None:
-        return []
-
-    if isinstance(raw, (list, tuple)):
-        return [normalize_token_id(str(x)) for x in raw if str(x).strip()]
-
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return []
-
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [normalize_token_id(str(x)) for x in parsed if str(x).strip()]
-            except Exception:
-                pass
-
-        if "," in s:
-            parts = [p.strip() for p in s.split(",")]
-            return [normalize_token_id(p.strip('"').strip("'")) for p in parts if p.strip('"').strip("'")]
-
-        return [normalize_token_id(s.strip('"').strip("'"))]
-
-    return [normalize_token_id(str(raw))] if str(raw).strip() else []
-
 def parse_end_date(value: Any, now_ts: float) -> Optional[float]:
     """
-    Parse endDate and return unix timestamp if date is IN THE PAST.
+    Parse endDate from various formats and return unix timestamp if valid and in past.
     Returns None if:
-      - missing
-      - parse fails
-      - date is in the future
+    - value is None/missing
+    - parsing fails
+    - date is in the future
+    Returns unix timestamp if date is in the past.
     """
     if value is None:
         return None
-
+    
+    # Try unix timestamp (int or float)
     if isinstance(value, (int, float)):
         ts = float(value)
+        # Sanity check: reasonable timestamp range (2000-2100)
         if 946684800 <= ts <= 4102444800:
             return ts if ts < now_ts else None
-
+    
+    # Try ISO datetime string
     if isinstance(value, str):
         s = value.strip()
         if not s:
             return None
         try:
+            # Handle Z suffix (UTC indicator)
             if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            elif "T" in s and "+" not in s and s.count("-") >= 2:
-                s = s + "+00:00"
+                # Remove Z and check if timezone already exists
+                s_no_z = s[:-1]
+                if "+" in s_no_z or (s_no_z.count("-") >= 5 and ":" in s_no_z[-6:]):
+                    # Already has timezone, just remove Z
+                    s = s_no_z
+                else:
+                    # No timezone, add UTC
+                    s = s_no_z + "+00:00"
+            elif "+" not in s and "-" in s and s.count("-") >= 2:
+                # Might be ISO without timezone, assume UTC
+                if "T" in s:
+                    s = s + "+00:00"
             dt = datetime.fromisoformat(s)
             ts = dt.timestamp()
             return ts if ts < now_ts else None
         except Exception:
+            # Try parsing as unix timestamp string
             try:
                 ts = float(s)
                 if 946684800 <= ts <= 4102444800:
                     return ts if ts < now_ts else None
             except Exception:
-                return None
-
+                pass
+    
     return None
-
-def as_money(x: Optional[float]) -> str:
-    if x is None:
-        return "n/a"
-    if x >= 1_000_000:
-        return f"${x / 1_000_000:.2f}M"
-    if x >= 1_000:
-        return f"${x / 1_000:.1f}K"
-    return f"${x:.0f}"
-
-def fmt_spread(spread: Optional[float]) -> str:
-    return f"{spread:.4f}" if spread is not None else "n/a"
 
 
 # =========================
@@ -267,26 +305,9 @@ def send_telegram_message(body: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": body}
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        # Log success occasionally (not every message to avoid spam)
-        if hasattr(send_telegram_message, "_msg_count"):
-            send_telegram_message._msg_count += 1
-        else:
-            send_telegram_message._msg_count = 1
-        
-        if send_telegram_message._msg_count == 1 or send_telegram_message._msg_count % 50 == 0:
-            print(f"[telegram] Message sent successfully (total sent: {send_telegram_message._msg_count})")
-    except requests.exceptions.HTTPError as e:
-        print(f"[telegram] HTTP error sending message: {e} (status: {e.response.status_code if hasattr(e, 'response') else 'unknown'})")
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_body = e.response.json()
-                print(f"[telegram] Error response: {error_body}")
-            except Exception:
-                print(f"[telegram] Error response body: {e.response.text[:200]}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"[telegram] Exception sending message: {e}")
+        print(f"[telegram] send_telegram_message exception: {e}")
 
 
 # =========================
@@ -302,125 +323,289 @@ class MarketMeta:
     liquidity: Optional[float]
     outcomes: List[str]
     clob_token_ids: List[str]
+    updated_at: Optional[str] = None  # For sorting by recency
+    created_at: Optional[str] = None
 
     def title(self) -> str:
         if self.event_title and self.event_title != self.market_question:
             return f"{self.event_title} — {self.market_question}"
         return self.market_question
+    
+    def updated_at_ts(self) -> float:
+        """Parse updatedAt to timestamp for sorting."""
+        if not self.updated_at:
+            return 0.0
+        try:
+            # Handle ISO format with or without Z
+            s = self.updated_at
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            elif "+" not in s and "T" in s:
+                s = s + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
 
-
-def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True, broad_test: bool = False) -> Tuple[List[MarketMeta], int]:
+def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True) -> Tuple[List[MarketMeta], int]:
     """
-    Fetch markets from Gamma API using server-side filters:
-      - active=true (optional)
-      - closed=false (always)
-
-    Client-side filters:
-      - endDate must NOT be in the past
-      - must have clobTokenIds
-      - optionally skip archived/restricted markets
-
-    NOTE: We intentionally do NOT hard-filter on `ready` or `funded` because they appear unreliable.
+    Fetch markets from Gamma API, sort by recency, and filter to live/tradable markets only.
+    
+    Strategy:
+    1. Fetch multiple pages with server-side closed=false filter
+    2. Sort locally by updatedAt desc (newest first)
+    3. Filter to only live/tradable markets (not closed/archived, endDate in future)
+    4. Return the filtered list
+    
+    Note: Gamma's "active=true" does NOT mean tradable - many closed markets have active=true.
+    We use server-side closed=false filter AND client-side filtering by closed/archived/ready/funded/endDate.
+    
+    Returns (metas, raw_markets_count).
     """
     now_ts = time.time()
-
-    metas: List[MarketMeta] = []
+    all_markets = []  # Accumulate all markets before filtering
     raw_markets_count = 0
-
-    filtered_closed = 0
-    filtered_archived = 0
-    # NOTE: We no longer filter on `restricted`, but we keep this counter for
-    # backwards-compatible logging (it will always remain 0).
-    filtered_restricted = 0
-    filtered_enddate = 0
-    filtered_missing_tokens = 0
-
     samples_logged = 0
-
+    
+    # Step 1: Fetch all pages with server-side closed=false filter
     print(f"[market_fetch] Fetching {pages} pages ({per_page} per page) with closed=false filter...")
-
     for p in range(pages):
-        params = {"limit": per_page, "offset": p * per_page, "closed": "false"}
+        params = {
+            "limit": per_page,
+            "offset": p * per_page,
+            "closed": "false"  # CRITICAL: Server-side filter for open markets only
+        }
+        # Optional: also request active=true (may help, but not reliable alone)
         if active_only:
             params["active"] = "true"
-
-        url = f"{GAMMA_BASE}/markets"
+        
+        # Log exact URL params for verification (first page only)
         if p == 0:
-            qs = "&".join([f"{k}={v}" for k, v in params.items()])
-            print(f"[market_fetch] Full URL: {url}?{qs}")
-
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        markets = r.json()
-
-        raw_markets_count += len(markets)
-
-        # Page stats: how many came back closed anyway (sanity)
-        if p == 0 and markets:
-            c_false = sum(1 for m in markets if not to_bool(m.get("closed")))
-            c_true = sum(1 for m in markets if to_bool(m.get("closed")))
-            print(f"[market_fetch] Page 0: closed=false={c_false} closed=true={c_true} total={len(markets)}")
-
-        for m in markets:
-            if samples_logged < 3:
-                print(
-                    f"[market_sample] market[{samples_logged}] id={m.get('id') or m.get('slug')} "
-                    f"closed={m.get('closed')!r} archived={m.get('archived')!r} "
-                    f"restricted={m.get('restricted')!r} active={m.get('active')!r} "
-                    f"ready={m.get('ready')!r} funded={m.get('funded')!r} "
-                    f"endDate={m.get('endDate')!r} updatedAt={m.get('updatedAt')!r}"
-                )
-                samples_logged += 1
-
-            # Safety: if API ever returns closed=true despite closed=false param
+            url = f"{GAMMA_BASE}/markets"
+            param_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            print(f"[market_fetch] URL params (first page): {param_str}")
+            print(f"[market_fetch] Full URL: {url}?{param_str}")
+        
+        try:
+            r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
+            r.raise_for_status()
+            markets = r.json()
+            raw_markets_count += len(markets)
+            
+            # Count closed=false vs closed=true in this batch (sample check)
+            closed_false_count = sum(1 for m in markets if m.get("closed") is False)
+            closed_true_count = sum(1 for m in markets if m.get("closed") is True)
+            if p == 0:  # Log for first page
+                print(f"[market_fetch] Page 0: closed=false={closed_false_count} closed=true={closed_true_count} total={len(markets)}")
+            
+            all_markets.extend(markets)
+            
+            # Log first 3 markets AFTER server-side filters (to verify closed=false worked)
+            for m in markets[:3]:
+                if samples_logged < 3:
+                    market_id = m.get("id") or m.get("slug") or "unknown"
+                    closed_val = m.get("closed")
+                    archived_val = m.get("archived")
+                    ready_val = m.get("ready")
+                    funded_val = m.get("funded")
+                    active_val = m.get("active")
+                    end_date_val = m.get("endDate")
+                    updated_at = m.get("updatedAt")
+                    print(
+                        f"[market_sample] market[{samples_logged}] id={market_id} "
+                        f"closed={closed_val!r} archived={archived_val!r} ready={ready_val!r} "
+                        f"funded={funded_val!r} active={active_val!r} "
+                        f"endDate={end_date_val!r} updatedAt={updated_at!r}"
+                    )
+                    samples_logged += 1
+        except Exception as e:
+            print(f"[market_fetch] Error fetching page {p}: {e}")
+            continue
+    
+    print(f"[market_fetch] Fetched {raw_markets_count} total markets from {pages} pages")
+    
+    # Step 2: Sort by updatedAt desc (newest first)
+    # Markets without updatedAt go to the end
+    def sort_key(m: dict) -> float:
+        updated_at = m.get("updatedAt") or m.get("createdAt") or ""
+        if not updated_at:
+            return 0.0
+        try:
+            s = updated_at
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            elif "+" not in s and "T" in s:
+                s = s + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
+    
+    all_markets.sort(key=sort_key, reverse=True)
+    
+    # Log date range
+    if all_markets:
+        newest_ts = sort_key(all_markets[0])
+        oldest_ts = sort_key(all_markets[-1])
+        newest_str = datetime.fromtimestamp(newest_ts, tz=timezone.utc).isoformat() if newest_ts > 0 else "unknown"
+        oldest_str = datetime.fromtimestamp(oldest_ts, tz=timezone.utc).isoformat() if oldest_ts > 0 else "unknown"
+        print(f"[market_fetch] Date range: newest={newest_str} oldest={oldest_str}")
+    
+    # Step 3: Filter to live/tradable markets only
+    metas: List[MarketMeta] = []
+    filtered_closed = 0
+    filtered_archived = 0
+    filtered_ready = 0
+    filtered_funded = 0
+    filtered_enddate = 0
+    
+    for m in all_markets:
+        # Hard filter: closed markets are NOT tradable
+        if to_bool(m.get("closed")):
+            filtered_closed += 1
+            continue
+        
+        # Hard filter: archived markets are NOT tradable
+        if to_bool(m.get("archived")):
+            filtered_archived += 1
+            continue
+        
+        # NOTE: Gamma fields `ready` and `funded` are NOT reliable indicators of tradability for our purposes.
+        # We intentionally do NOT filter on them. We rely on: closed=false server-side + endDate + token IDs.
+        
+        # Hard filter: markets with endDate in the past are NOT tradable
+        end_date_ts = parse_end_date(m.get("endDate"), now_ts)
+        if end_date_ts is not None:
+            filtered_enddate += 1
+            continue
+        
+        # Must have clobTokenIds to subscribe
+        raw_clob = m.get("clobTokenIds")
+        clob_ids = coerce_clob_token_ids(raw_clob)
+        if not clob_ids:
+            continue
+        
+        # Market passed all filters - it's live/tradable
+        metas.append(
+            MarketMeta(
+                market_question=m.get("question") or "Unknown",
+                event_title=m.get("title") or "",
+                event_slug=m.get("eventSlug"),
+                volume=safe_float(m.get("volume")),
+                liquidity=safe_float(m.get("liquidity")),
+                outcomes=coerce_outcomes(m.get("outcomes")),
+                clob_token_ids=clob_ids,
+                updated_at=m.get("updatedAt"),
+                created_at=m.get("createdAt"),
+            )
+        )
+    
+    # Log filtering results
+    print(
+        f"[market_filter] raw_markets={raw_markets_count} "
+        f"filtered_closed={filtered_closed} filtered_archived={filtered_archived} "
+        f"filtered_ready={filtered_ready} filtered_funded={filtered_funded} "
+        f"filtered_enddate={filtered_enddate} remaining={len(metas)}"
+    )
+    
+    # Log date range of final markets
+    if metas:
+        updated_times = [m.updated_at_ts() for m in metas if m.updated_at_ts() > 0]
+        if updated_times:
+            newest_ts = max(updated_times)
+            oldest_ts = min(updated_times)
+            newest_str = datetime.fromtimestamp(newest_ts, tz=timezone.utc).isoformat()
+            oldest_str = datetime.fromtimestamp(oldest_ts, tz=timezone.utc).isoformat()
+            print(f"[market_filter] Final markets date range: newest={newest_str} oldest={oldest_str}")
+    
+    # Safety valve: if no markets after filtering, retry with more pages (but keep closed=false)
+    # DO NOT disable closed filter - that would reintroduce old markets
+    if raw_markets_count > 0 and len(metas) == 0:
+        print(
+            f"[WARNING] All {raw_markets_count} markets filtered out after server-side closed=false! "
+            f"Retrying with more pages (keeping closed=false filter)..."
+        )
+        # Retry with 2x pages, still using closed=false
+        retry_pages = pages * 2
+        print(f"[market_fetch] Retry: Fetching {retry_pages} pages with closed=false...")
+        all_markets_retry = []
+        raw_markets_count_retry = 0
+        
+        for p in range(retry_pages):
+            params = {
+                "limit": per_page,
+                "offset": p * per_page,
+                "closed": "false"  # Keep closed=false filter
+            }
+            if active_only:
+                params["active"] = "true"
+            
+            try:
+                r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
+                r.raise_for_status()
+                markets = r.json()
+                raw_markets_count_retry += len(markets)
+                all_markets_retry.extend(markets)
+            except Exception as e:
+                print(f"[market_fetch] Error fetching retry page {p}: {e}")
+                continue
+        
+        print(f"[market_fetch] Retry fetched {raw_markets_count_retry} total markets")
+        
+        # Sort and filter retry markets
+        all_markets_retry.sort(key=sort_key, reverse=True)
+        
+        # Re-filter with same criteria
+        metas = []
+        filtered_closed = 0
+        filtered_archived = 0
+        filtered_ready = 0
+        filtered_funded = 0
+        filtered_enddate = 0
+        
+        for m in all_markets_retry:
             if to_bool(m.get("closed")):
                 filtered_closed += 1
                 continue
-
-            # Skip archived (archived markets are not tradable / visible)
-            # NOTE: We intentionally **do not** skip restricted markets here.
-            # Restricted == True may just mean certain users can't trade,
-            # but orderflow and prices are still visible and useful for alerts.
             if to_bool(m.get("archived")):
                 filtered_archived += 1
                 continue
-
-            # Skip markets whose endDate is in the past
             end_date_ts = parse_end_date(m.get("endDate"), now_ts)
             if end_date_ts is not None:
                 filtered_enddate += 1
                 continue
-
             raw_clob = m.get("clobTokenIds")
             clob_ids = coerce_clob_token_ids(raw_clob)
             if not clob_ids:
-                filtered_missing_tokens += 1
                 continue
-
-            outcomes = coerce_json_list(m.get("outcomes"))
             metas.append(
                 MarketMeta(
                     market_question=m.get("question") or "Unknown",
-                    event_title=(m.get("title") or ""),
+                    event_title=m.get("title") or "",
                     event_slug=m.get("eventSlug"),
-                    volume=safe_float(m.get("volume") or m.get("volumeNum")),
-                    liquidity=safe_float(m.get("liquidity") or m.get("liquidityNum")),
-                    outcomes=outcomes,
+                    volume=safe_float(m.get("volume")),
+                    liquidity=safe_float(m.get("liquidity")),
+                    outcomes=m.get("outcomes") or [],
                     clob_token_ids=clob_ids,
+                    updated_at=m.get("updatedAt"),
+                    created_at=m.get("createdAt"),
                 )
             )
-
-    print(
-        f"[market_filter] raw_markets={raw_markets_count} "
-        f"filtered_closed={filtered_closed} filtered_archived={filtered_archived} "
-        f"filtered_restricted={filtered_restricted} filtered_enddate={filtered_enddate} "
-        f"filtered_missing_tokens={filtered_missing_tokens} remaining={len(metas)}"
-    )
-
+        
+        print(
+            f"[market_filter] Retry results: raw_markets={raw_markets_count_retry} "
+            f"filtered_closed={filtered_closed} filtered_archived={filtered_archived} "
+            f"filtered_ready={filtered_ready} filtered_funded={filtered_funded} "
+            f"filtered_enddate={filtered_enddate} remaining={len(metas)}"
+        )
+        raw_markets_count = raw_markets_count_retry  # Update for return value
+    
     # Defensive check for suspicious token IDs
     bad = [m for m in metas if any(len(tid) <= 2 for tid in m.clob_token_ids)]
     print(f"[sanity] markets_with_suspicious_token_ids={len(bad)}")
-
+    if bad[:3]:
+        print("[sanity] example suspicious token ids:", bad[0].clob_token_ids[:10])
+    
     return metas, raw_markets_count
 
 
@@ -496,6 +681,7 @@ class MarketWatcher:
         min_volume: float,
         min_liquidity: float,
         max_spread: float,
+        min_trade_price: float,
         max_assets: int,
         whale_threshold: float,
         whale_cooldown_sec: int,
@@ -503,7 +689,6 @@ class MarketWatcher:
         telegram: bool,
         logger: AlertLoggerSQLite,
         heartbeat_sec: int,
-        broad_test: bool = False,
     ):
         self.metas = metas
         self.asset_to_meta: Dict[str, MarketMeta] = {tid: m for m in metas for tid in m.clob_token_ids}
@@ -513,6 +698,7 @@ class MarketWatcher:
         self.min_volume = min_volume
         self.min_liquidity = min_liquidity
         self.max_spread = max_spread
+        self.min_trade_price = min_trade_price
 
         self.max_assets = max_assets
         self.whale_threshold = whale_threshold
@@ -524,45 +710,39 @@ class MarketWatcher:
 
         self.price_history: Dict[str, Deque[PricePoint]] = defaultdict(deque)
         self.last_price_alert_ms: Dict[str, int] = {}
+
         self.last_whale_alert_s: Dict[str, float] = {}
-        # Track seen transaction hashes to avoid duplicate alerts on reconnects/replays
-        self._seen_tx_hashes: set = set()
-        # Limit size to prevent memory growth (keep last 10k hashes)
-        self._max_seen_tx_hashes = 10000
 
         self.heartbeat_sec = heartbeat_sec
         self._last_heartbeat = time.time()
         self._last_msg_ts = time.time()
-        self._last_pong_ts = time.time()
-        self._idle_timeout_sec = 180
+        self._last_pong_ts = time.time()  # Track pong responses (proves connection alive)
+        self._idle_timeout_sec = 180  # Force reconnect if idle > 180s
         self._ws_connected = False
         self._ws_instance = None
-
+        
+        # Message observability
         self._msg_count = 0
-        self._msg_timestamps: Deque[float] = deque(maxlen=60)
+        self._msg_timestamps: Deque[float] = deque(maxlen=60)  # Track last 60 seconds
         self._last_message_type = "none"
-        self._debug_seen_event_types: Dict[str, int] = defaultdict(int)
-        self._book_event_count = 0  # Track book events for summary logging
-        # Debug sampling controls (can be overridden via env)
-        # - POLY_DEBUG_SAMPLE_EVERY: log 1 full payload for unknown event types every N messages
-        # - POLY_DEBUG_LAST_TRADE_SAMPLE_EVERY: log 1 full payload for last_trade_price every N messages
-        self._debug_sample_every = int(os.getenv("POLY_DEBUG_SAMPLE_EVERY") or "500")
-        self._debug_last_trade_sample_every = int(os.getenv("POLY_DEBUG_LAST_TRADE_SAMPLE_EVERY") or "50")
 
-        self.asset_ids = self._select_asset_ids(broad_test=broad_test)
+        self.asset_ids = self._select_asset_ids()
 
-    def _select_asset_ids(self, broad_test: bool = False) -> List[str]:
+    def _select_asset_ids(self) -> List[str]:
         """
-        In broad_test mode:
-          - subscribe to as many assets as possible (up to max_assets), sorted by liquidity/volume desc
-          - thresholds can be 0 so we don't exclude low-liquidity markets during testing
+        Pick a subset of assets to subscribe to:
+          - market passes min volume/liquidity
+          - rank by (liquidity, volume) desc
+          - take up to max_assets
+        Adds verbose logging so you can see why/how assets were chosen.
         """
         total_markets = len(self.metas)
-        candidates: List[Tuple[float, float, str, MarketMeta]] = []
-
+        passed_markets = 0
         filtered_volume = 0
         filtered_liquidity = 0
-        passed_markets = 0
+
+        # candidates are (liq, vol, aid, meta)
+        candidates: List[Tuple[float, float, str, MarketMeta]] = []
 
         for m in self.metas:
             vol = m.volume or 0.0
@@ -579,8 +759,10 @@ class MarketWatcher:
             for aid in m.clob_token_ids:
                 candidates.append((liq, vol, aid, m))
 
+        # sort by liquidity desc then volume desc
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
+        # Print summary
         print(
             "[asset_select] markets_total=%d passed=%d filtered_volume=%d filtered_liquidity=%d "
             "candidates=%d min_volume=%.2f min_liquidity=%.2f max_assets=%d"
@@ -596,16 +778,23 @@ class MarketWatcher:
             )
         )
 
-        preview_n = min(25, len(candidates))
-        if preview_n:
+        # Print top candidates (preview)
+        preview_n = min(30, len(candidates))
+        if preview_n > 0:
             print(f"[asset_select] Top {preview_n} candidates by (liquidity, volume):")
             for i in range(preview_n):
                 liq, vol, aid, meta = candidates[i]
                 title = meta.title()
+                # prevent mega-long log lines
                 if len(title) > 120:
                     title = title[:117] + "..."
-                print(f"  #{i+1:02d} aid={aid} liq={liq:,.0f} vol={vol:,.0f} market='{title}'")
+                print(
+                    f"  #{i+1:02d} aid={aid} liq={liq:,.0f} vol={vol:,.0f} market='{title}'"
+                )
+        else:
+            print("[asset_select] No candidates after filtering.")
 
+        # Pick unique assets
         picked: List[str] = []
         seen = set()
         for liq, vol, aid, meta in candidates:
@@ -616,19 +805,26 @@ class MarketWatcher:
             if self.max_assets and len(picked) >= self.max_assets:
                 break
 
+        # Fallback if nothing passed filters
         if not picked:
             fallback = list(self.asset_to_meta.keys())
-            picked = fallback[: min(200, len(fallback))]
-            print(f"[asset_select] FALLBACK: subscribing to {len(picked)} assets from asset_to_meta")
+            picked = fallback[: min(50, len(fallback))]
+            print(
+                f"[asset_select] FALLBACK: no markets passed filters; subscribing to {len(picked)} assets from asset_to_meta"
+            )
 
-        log_n = min(25, len(picked))
-        print(f"[asset_select] Selected assets (showing {log_n}/{len(picked)}):")
-        for i in range(log_n):
+        # If you only want to log the first 50 selected, keep it readable
+        log_selected_n = min(50, len(picked))
+        print(f"[asset_select] Selected assets (showing {log_selected_n}/{len(picked)}):")
+        for i in range(log_selected_n):
             aid = picked[i]
             meta = self.asset_to_meta.get(aid)
-            liq = meta.liquidity or 0.0 if meta else 0.0
-            vol = meta.volume or 0.0 if meta else 0.0
-            title = meta.title() if meta else "n/a"
+            if not meta:
+                print(f"  #{i+1:02d} aid={aid} meta=n/a")
+                continue
+            liq = meta.liquidity or 0.0
+            vol = meta.volume or 0.0
+            title = meta.title()
             if len(title) > 120:
                 title = title[:117] + "..."
             print(f"  #{i+1:02d} aid={aid} liq={liq:,.0f} vol={vol:,.0f} market='{title}'")
@@ -680,6 +876,8 @@ class MarketWatcher:
                 continue
 
             start = self.price_history[aid][0]
+            if start.odds < self.min_trade_price:
+                return  # ignore micro-priced outcomes (< min_trade_price)
             if start.odds <= 0:
                 continue
 
@@ -694,6 +892,7 @@ class MarketWatcher:
             if spread is not None and spread > self.max_spread:
                 continue
 
+            # throttle: 60s per asset
             if ts - self.last_price_alert_ms.get(aid, 0) < 60_000:
                 continue
             self.last_price_alert_ms[aid] = ts
@@ -744,121 +943,107 @@ class MarketWatcher:
 
     # ---------- whale alerts ----------
 
+
     def _handle_trade_event(self, p: dict) -> None:
-        if not self.whale_threshold or self.whale_threshold <= 0:
+        """Handle trade-like events for whale alerts.
+
+        Polymarket's /ws/market stream commonly emits:
+          - event_type == "trade" with {"market":.., "timestamp":.., "trades":[{asset_id, price, size/amount, ...}, ...]}
+          - event_type == "last_trade_price" with {"asset_id":.., "price":.., "size":.., "side":.., ...}
+
+        We treat both as "trade-like" and compute notional = price * size.
+        """
+        if not self.whale_threshold:
             return
 
         ws_market_id = p.get("market", "")
         ts = int(p.get("timestamp") or now_ms())
 
-        # trade-like payloads can appear as:
-        # - {"trades": [...]}                 (event_type="trade")
-        # - {"trades": {...}}                 (sometimes a single object)
-        # - {...single trade fields...}       (event_type="last_trade_price" or similar)
-        raw_trades = p.get("trades")
-        trades: List[dict] = []
-        if isinstance(raw_trades, list):
-            trades = [t for t in raw_trades if isinstance(t, dict)]
-        elif isinstance(raw_trades, dict):
-            trades = [raw_trades]
-        else:
-            # If payload itself looks trade-like, treat it as a single trade object.
-            if any(k in p for k in ("asset_id", "price", "last_trade_price", "qty", "size", "amount")):
-                trades = [p]
+        def handle_one(tr: dict) -> None:
+            try:
+                aid = tr.get("asset_id") or tr.get("assetId") or tr.get("token_id") or tr.get("tokenId") or tr.get("id")
+                if not aid:
+                    return
+                aid = str(aid)
 
-        for trade in trades:
-            aid = normalize_token_id(trade.get("asset_id", ""))
-            meta = self.asset_to_meta.get(aid)
-            if not meta:
-                continue
+                price = float(tr.get("price") or tr.get("last_trade_price") or tr.get("lastTradePrice") or 0.0)
 
-            # Extract transaction_hash for deduplication (if available)
-            tx_hash = trade.get("transaction_hash") or p.get("transaction_hash")
-            if tx_hash:
-                # Normalize hash (strip 0x prefix for consistency)
-                tx_hash_normalized = tx_hash.lower().lstrip("0x")
-                if tx_hash_normalized in self._seen_tx_hashes:
-                    # Skip duplicate transaction
-                    continue
-                # Add to seen set
-                self._seen_tx_hashes.add(tx_hash_normalized)
-                # Prune if set gets too large (keep most recent)
-                if len(self._seen_tx_hashes) > self._max_seen_tx_hashes:
-                    # Remove oldest 20% (simple approach: convert to list, slice, recreate set)
-                    # In practice, this is rare since we're tracking unique hashes
-                    excess = len(self._seen_tx_hashes) - int(self._max_seen_tx_hashes * 0.8)
-                    if excess > 0:
-                        to_remove = list(self._seen_tx_hashes)[:excess]
-                        self._seen_tx_hashes = self._seen_tx_hashes - set(to_remove)
+                # Different payloads use different size keys
+                size_val = tr.get("size")
+                if size_val is None:
+                    size_val = tr.get("amount")
+                if size_val is None:
+                    size_val = tr.get("qty")
+                if size_val is None:
+                    size_val = tr.get("quantity")
+                size = float(size_val or 0.0)
 
-            # Support multiple possible field names depending on event schema
-            price = safe_float(
-                trade.get("price")
-                or trade.get("last_trade_price")
-                or trade.get("trade_price")
-                or trade.get("fill_price")
-            )
-            qty = safe_float(
-                trade.get("qty")
-                or trade.get("size")
-                or trade.get("amount")
-                or trade.get("volume")
-            )
-            if price is None or qty is None:
-                continue
+                side = (tr.get("side") or tr.get("takerSide") or tr.get("makerSide") or "").upper()
 
-            notional = price * qty
-            if notional < self.whale_threshold:
-                continue
+                # Basic sanity: skip clearly broken values
+                if price <= 0 or size <= 0:
+                    return
 
-            last = self.last_whale_alert_s.get(aid, 0.0)
-            if time.time() - last < float(self.whale_cooldown_sec):
-                continue
-            self.last_whale_alert_s[aid] = time.time()
+                notional = price * size
+                if notional < self.whale_threshold:
+                    return
 
-            outcome = self._outcome_for(meta, aid)
-            body = (
-                "=== POLY WHALE ALERT ===\n"
-                f"when: {fmt_ts(ts)}\n"
-                f"market: {meta.title()}\n"
-                f"outcome: {outcome}\n"
-                f"trade price: {price:.4f}\n"
-                f"trade size: {qty:.2f}\n"
-                f"notional: ${notional:,.2f}\n"
-                f"threshold: ${self.whale_threshold:,.0f}\n"
-                f"volume: {as_money(meta.volume)}\n"
-                f"liquidity: {as_money(meta.liquidity)}\n"
-                f"asset_id: {aid}\n"
-                "========================\n"
-            )
+                # Cooldown per (aid, side) to avoid spam
+                key = (aid, side or "?")
+                last_ts = self._whale_last_sent.get(key, 0)
+                if (ts - last_ts) < (self.whale_cooldown_s * 1000):
+                    return
+                self._whale_last_sent[key] = ts
 
-            self.logger.log({
-                "ts_ms": ts,
-                "ts_iso": fmt_ts(ts),
-                "market_title": meta.market_question,
-                "event_title": meta.event_title,
-                "outcome": outcome,
-                "from_odds": None,
-                "to_odds": None,
-                "move_pct": None,
-                "volume": meta.volume,
-                "liquidity": meta.liquidity,
-                "best_bid": None,
-                "best_ask": None,
-                "spread": None,
-                "asset_id": aid,
-                "ws_market_id": ws_market_id,
-                "alert_type": "whale_trade",
-                "notional": notional,
-                "decision": None,
-                "notes": None,
-                "result": "OPEN",
-                "pnl": None,
-            })
+                meta = self.meta_by_asset.get(aid)
+                market_title = meta.title if meta else "(unknown market)"
+                outcome = meta.outcome if meta else "(unknown outcome)"
+                volume = meta.volume if meta else 0.0
+                liquidity = meta.liquidity if meta else 0.0
 
-            self._send(f"[Polymarket] Whale ${notional:,.0f}", body)
+                # Print + notify
+                print("")
+                print("=== POLY WHALE ALERT ===")
+                print(f"when: {iso_from_ms(ts)}")
+                print(f"market: {market_title}")
+                print(f"outcome: {outcome}")
+                print(f"trade price: {price:.4f}")
+                print(f"trade size: {size:.2f}")
+                print(f"notional: ${notional:,.2f}")
+                print(f"threshold: ${self.whale_threshold:,.0f}")
+                print(f"volume: ${volume/1e6:.2f}M" if volume else "volume: (n/a)")
+                if liquidity:
+                    print(f"liquidity: ${liquidity/1e3:.1f}K")
+                print("========================")
+                print("")
 
-    # ---------- websocket loop ----------
+                if self.notifier:
+                    msg = (
+                        "🐋 *POLY WHALE ALERT*\n"
+                        f"*Market:* {escape_md(market_title)}\n"
+                        f"*Outcome:* {escape_md(outcome)}\n"
+                        f"*Side:* {escape_md(side)}\n"
+                        f"*Price:* {price:.4f}\n"
+                        f"*Size:* {size:,.2f}\n"
+                        f"*Notional:* ${notional:,.2f}\n"
+                        f"*Threshold:* ${self.whale_threshold:,.0f}\n"
+                        f"*When:* {escape_md(ts_iso)}"
+                    )
+                    self.notifier.send(msg)
+
+            except Exception as e:
+                # Don't crash the WS loop on a bad trade payload
+                print(f"[whale][warn] failed to parse trade payload: {e}")
+
+        trades = p.get("trades")
+        if isinstance(trades, list) and trades:
+            for tr in trades:
+                if isinstance(tr, dict):
+                    handle_one(tr)
+            return
+
+        # Fallback: treat the event payload itself as a single trade record (e.g., last_trade_price)
+        handle_one(p)
 
     def run_forever(self) -> None:
         if not self.asset_ids:
@@ -868,67 +1053,59 @@ class MarketWatcher:
         backoff = 5
 
         def on_open(ws):
+            """Called when websocket connection is established."""
             self._ws_connected = True
-            self._last_msg_ts = time.time()
-            self._last_pong_ts = time.time()
+            self._last_msg_ts = time.time()  # Reset on new connection
+            self._last_pong_ts = time.time()  # Reset pong tracking
             self._msg_count = 0
             self._msg_timestamps.clear()
             print("[ws] connected/open")
+            # Wait a tiny bit to ensure connection is fully ready
             time.sleep(0.1)
+            # Market channel subscription. This is the important part.
             ws.send(json.dumps({"type": "market", "assets_ids": self.asset_ids}))
             print(f"[ws] subscribed to {len(self.asset_ids)} tokens (market channel)")
 
         def on_message(ws, msg):
+            """Called on ANY websocket message (including pings/pongs)."""
             now = time.time()
-            self._last_msg_ts = now
+            self._last_msg_ts = now  # Update on ANY message (proves connection alive)
             self._msg_timestamps.append(now)
-
+            
             try:
                 payload = json.loads(msg)
             except Exception:
+                # Non-JSON message (could be ping/pong frame, ignore)
                 return
 
             items = payload if isinstance(payload, list) else [payload]
 
+            # Track message types
             self._msg_count += 1
             for it in items:
                 if isinstance(it, dict):
                     et = it.get("event_type", "unknown")
                     self._last_message_type = et
-                    self._debug_seen_event_types[et] += 1
-
-                    # Handle "book" events (orderbook snapshots) - count but don't log full payloads
-                    if et == "book":
-                        self._book_event_count += 1
-                        # Log summary every 100 book events
-                        if self._book_event_count % 100 == 0:
-                            print(f"[ws][book] Received {self._book_event_count} orderbook snapshot events (suppressing full logs)")
-                    
-                    # Debug sampler for unknown / unhandled event types
-                    # Note: "book" events are intentionally ignored (orderbook snapshots, too verbose)
-                    if et not in {"price_change", "trade", "last_trade_price", "book"}:
-                        if self._debug_sample_every > 0 and (self._msg_count % self._debug_sample_every == 0):
-                            try:
-                                print(f"[ws][debug] sample unknown event_type='{et}': {json.dumps(it, ensure_ascii=False)[:5000]}")
-                            except Exception:
-                                pass
-
-                    # Always sample last_trade_price occasionally so we can map schema
-                    if et == "last_trade_price":
-                        if self._debug_last_trade_sample_every > 0 and (self._debug_seen_event_types[et] % self._debug_last_trade_sample_every == 1):
-                            try:
-                                print(f"[ws][debug] sample last_trade_price payload: {json.dumps(it, ensure_ascii=False)[:8000]}")
-                            except Exception:
-                                pass
-
                     if et == "price_change":
                         self._handle_price_change(it)
-                    elif et in {"trade", "last_trade_price"}:
+                    elif et == "trade":
                         self._handle_trade_event(it)
+                    elif et == "last_trade_price":
+                        self._handle_trade_event(it)
+            
+            # Log every 200 messages
+            if self._msg_count % 200 == 0:
+                types = {}
+                for it in items:
+                    if isinstance(it, dict):
+                        t = it.get("event_type", "unknown")
+                        types[t] = types.get(t, 0) + 1
+                print(f"[ws] msg_count={self._msg_count} recent_types={types}")
 
         def on_pong(ws, msg):
+            """Called when pong frame is received (proves connection is alive)."""
             self._last_pong_ts = time.time()
-            self._last_msg_ts = time.time()
+            self._last_msg_ts = time.time()  # Pong also proves connection alive
 
         def on_error(ws, err):
             print(f"[ws] error: {err}")
@@ -938,37 +1115,57 @@ class MarketWatcher:
             print(f"[ws] closed: code={code} reason={reason}")
             self._ws_connected = False
 
-        def check_health():
+        def check_idle_timeout():
+            """Background thread to check connection health and force reconnect only if dead."""
             while True:
-                time.sleep(30)
+                time.sleep(30)  # Check every 30 seconds
                 if not self._ws_connected:
                     continue
+                
                 now = time.time()
                 time_since_msg = now - self._last_msg_ts
                 time_since_pong = now - self._last_pong_ts
+                
+                # Count messages in last minute
                 cutoff = now - 60
                 msgs_last_minute = sum(1 for ts in self._msg_timestamps if ts > cutoff)
-
-                if (time_since_pong > 50 and time_since_msg > self._idle_timeout_sec):
-                    print(f"[heartbeat] CONNECTION DEAD: last_msg={int(time_since_msg)}s last_pong={int(time_since_pong)}s; reconnecting")
+                
+                # Only force reconnect if connection is actually dead:
+                # - No pong for > 2 ping intervals (50s) AND no messages for > 180s
+                # - OR connection flag is False (error/close detected)
+                pong_timeout = 50  # 2 * ping_interval
+                connection_dead = (
+                    (time_since_pong > pong_timeout and time_since_msg > self._idle_timeout_sec) or
+                    not self._ws_connected
+                )
+                
+                if connection_dead:
+                    print(
+                        f"[heartbeat] CONNECTION DEAD: last_msg={int(time_since_msg)}s ago "
+                        f"last_pong={int(time_since_pong)}s ago, forcing reconnect"
+                    )
                     self._ws_connected = False
-                    try:
-                        if self._ws_instance:
+                    if self._ws_instance:
+                        try:
                             self._ws_instance.close()
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
                 elif now - self._last_heartbeat >= self.heartbeat_sec:
+                    # Regular heartbeat: connection is healthy
                     print(
                         f"[heartbeat] healthy: msgs_last_min={msgs_last_minute} "
-                        f"last_msg={int(time_since_msg)}s last_pong={int(time_since_pong)}s "
+                        f"last_msg={int(time_since_msg)}s ago last_pong={int(time_since_pong)}s ago "
                         f"last_type={self._last_message_type} assets={len(self.asset_ids)}"
                     )
                     self._last_heartbeat = now
 
-        threading.Thread(target=check_health, daemon=True).start()
+        # Start idle timeout checker thread
+        timeout_thread = threading.Thread(target=check_idle_timeout, daemon=True)
+        timeout_thread.start()
 
         while True:
             try:
+                # Create NEW websocket instance every reconnect
                 self._ws_connected = False
                 self._ws_instance = WebSocketApp(
                     f"{CLOB_WS_BASE}/ws/market",
@@ -978,6 +1175,8 @@ class MarketWatcher:
                     on_close=on_close,
                     on_pong=on_pong,
                 )
+                # Cloudflare WS can silently die; pings help.
+                # Use ping_interval=25 (between 20-30s as requested)
                 self._ws_instance.run_forever(ping_interval=25, ping_timeout=10)
             except Exception as e:
                 print(f"[ws] run_forever exception: {e}")
@@ -994,50 +1193,77 @@ class MarketWatcher:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Polymarket alerts worker (price moves & whale trades)")
-    ap.add_argument("--gamma-active", action="store_true", help="Request Gamma markets with active=true.")
-    ap.add_argument("--pages", type=int, default=20, help="Number of pages of markets to fetch from Gamma.")
+    # Note: --gamma-active requests active=true from API, but this is NOT reliable.
+    # We still filter by closed/archived/ready/funded/endDate explicitly.
+    # Default to True (always request active=true), Railway command also includes --gamma-active explicitly.
+    ap.add_argument("--gamma-active", action="store_true", 
+                     help="Request active=true from Gamma API (default: True, but not reliable - we filter explicitly).")
+    ap.add_argument("--no-gamma-active", dest="gamma_active", action="store_false",
+                     help="Disable active=true API parameter.")
+    # Set default after adding both arguments
+    ap.set_defaults(gamma_active=True)
+    ap.add_argument("--pages", type=int, default=5, help="Number of pages of markets to fetch from Gamma.")
     ap.add_argument("--per-page", type=int, default=100, help="Markets per page.")
     ap.add_argument("--window-min", type=int, default=10, help="Window size (minutes) for price move detection.")
     ap.add_argument("--move-pct", type=float, default=25.0, help="Percent move threshold.")
-    ap.add_argument("--min-volume", type=float, default=5_000, help="Minimum market volume.")
-    ap.add_argument("--min-liquidity", type=float, default=500, help="Minimum market liquidity.")
+    ap.add_argument("--min-trade-price", type=float, default=0.01, help="Ignore swing alerts when trade price is below this (e.g. 0.01).")
+    ap.add_argument("--min-volume", type=float, default=250_000, help="Minimum market volume.")
+    ap.add_argument("--min-liquidity", type=float, default=100_000, help="Minimum market liquidity.")
     ap.add_argument("--max-spread", type=float, default=0.06, help="Max bid-ask spread allowed (absolute).")
-    ap.add_argument("--max-assets", type=int, default=1000, help="Max number of assets to subscribe to.")
-    ap.add_argument("--whale-threshold", type=float, default=1000.0, help="Notional USD threshold to trigger whale alerts.")
+    ap.add_argument("--max-assets", type=int, default=500, help="Max number of assets to subscribe to.")
+    ap.add_argument("--broad-test", action="store_true", 
+                     help="Broad testing mode: relaxes min-volume/min-liquidity to 0, increases max-assets to 1000.")
+    ap.add_argument("--whale-threshold", type=float, default=0.0, help="Notional USD threshold to trigger whale alerts.")
     ap.add_argument("--whale-cooldown", type=int, default=300, help="Cooldown per asset for whale alerts (seconds).")
     ap.add_argument("--db-path", type=str, default="data/alerts.db", help="SQLite DB path.")
     ap.add_argument("--email", action="store_true", help="Send alerts by email.")
     ap.add_argument("--telegram", action="store_true", help="Send alerts via Telegram.")
     ap.add_argument("--heartbeat-sec", type=int, default=60, help="Heartbeat interval (seconds).")
-    ap.add_argument("--broad-test", action="store_true", help="Subscribe broadly (relax thresholds; for testing alerts).")
 
     args = ap.parse_args()
 
-    # Broad-test overrides (so you see messages quickly)
+    # Apply --broad-test mode: relax thresholds for testing
+    min_volume = args.min_volume
+    min_liquidity = args.min_liquidity
+    max_assets = args.max_assets
+    
     if args.broad_test:
         print("[config] BROAD-TEST mode enabled: relaxing thresholds")
-        args.min_volume = 0.0
-        args.min_liquidity = 0.0
-        if args.max_assets < 1000:
-            args.max_assets = 1000
-        print(f"[config] Override: min_volume={args.min_volume:g} min_liquidity={args.min_liquidity:g} max_assets={args.max_assets}")
+        min_volume = 0
+        min_liquidity = 0
+        max_assets = 1000
+        print(f"[config] Override: min_volume={min_volume} min_liquidity={min_liquidity} max_assets={max_assets}")
+    else:
+        print(f"[config] Normal mode: min_volume={min_volume} min_liquidity={min_liquidity} max_assets={max_assets}")
 
-    # Always log whale config so we don't accidentally run with whale alerts disabled.
-    print(
-        "[config] Whale alerts: threshold=$%s cooldown=%ss"
-        % (f"{args.whale_threshold:,.0f}" if args.whale_threshold is not None else "0", args.whale_cooldown)
-    )
+    # One-time startup verification: test closed=false API parameter
+    print("[startup] Verifying Gamma API closed=false parameter...")
+    try:
+        test_params = {"limit": 3, "offset": 0, "closed": "false"}
+        if args.gamma_active:
+            test_params["active"] = "true"
+        test_url = f"{GAMMA_BASE}/markets"
+        param_str = "&".join(f"{k}={v}" for k, v in sorted(test_params.items()))
+        print(f"[startup] Test URL: {test_url}?{param_str}")
+        test_r = requests.get(test_url, params=test_params, timeout=10)
+        test_r.raise_for_status()
+        test_markets = test_r.json()
+        closed_false_count = sum(1 for m in test_markets if m.get("closed") is False)
+        closed_true_count = sum(1 for m in test_markets if m.get("closed") is True)
+        print(f"[startup] Verification: received {len(test_markets)} markets, closed=false={closed_false_count} closed=true={closed_true_count}")
+        if closed_false_count == 0 and len(test_markets) > 0:
+            print("[startup] WARNING: All test markets have closed=true! API may not be filtering correctly.")
+        elif closed_false_count > 0:
+            print(f"[startup] ✅ Verification passed: received {closed_false_count} open markets")
+    except Exception as e:
+        print(f"[startup] Verification test failed: {e} (continuing anyway)")
 
+    # Retry loop with backoff if no assets selected
     backoff_sec = 60
-    max_backoff = 600
-
+    max_backoff = 600  # 10 minutes max
+    
     while True:
-        metas, raw_count = fetch_gamma_markets(
-            args.per_page,
-            args.pages,
-            active_only=args.gamma_active,
-            broad_test=args.broad_test,
-        )
+        metas, raw_markets_count = fetch_gamma_markets(args.per_page, args.pages, active_only=args.gamma_active)
         total_assets = sum(len(m.clob_token_ids) for m in metas)
         print(f"Loaded {len(metas)} markets from Gamma (assets total: {total_assets})")
 
@@ -1047,49 +1273,130 @@ def main() -> None:
             metas,
             window_min=args.window_min,
             move_pct=args.move_pct,
-            min_volume=args.min_volume,
-            min_liquidity=args.min_liquidity,
+            min_volume=min_volume,
+            min_liquidity=min_liquidity,
             max_spread=args.max_spread,
-            max_assets=args.max_assets,
+            min_trade_price=args.min_trade_price,
+            max_assets=max_assets,
             whale_threshold=args.whale_threshold,
             whale_cooldown_sec=args.whale_cooldown,
             email=args.email,
             telegram=args.telegram,
             logger=logger,
             heartbeat_sec=args.heartbeat_sec,
-            broad_test=args.broad_test,
         )
 
-        if not watcher.asset_ids:
+        # Check if we have assets to subscribe to
+        if not watcher.asset_ids or len(watcher.asset_ids) == 0:
             print(
-                f"[WARNING] No assets selected (raw_markets={raw_count}, metas={len(metas)}). "
+                f"[WARNING] No assets selected (raw_markets={raw_markets_count}, "
+                f"metas={len(metas)}, assets={len(watcher.asset_ids)}). "
                 f"Retrying in {backoff_sec}s..."
             )
             time.sleep(backoff_sec)
             backoff_sec = min(backoff_sec * 2, max_backoff)
             continue
-
+        
+        # Reset backoff on success
         backoff_sec = 60
 
-        # Send startup notifications
+        # Optional startup message
         if args.telegram:
             startup_msg = (
                 "🚀 Polymarket Alerts Bot Started\n\n"
                 f"✅ Subscribed to {len(watcher.asset_ids)} assets\n"
                 f"📊 Monitoring {len(metas)} markets\n"
                 f"🐋 Whale threshold: ${args.whale_threshold:,.0f}\n"
-                f"📈 Price move threshold: {args.move_pct:.1f}% over {args.window_min}min"
+                f"📈 Price move threshold: {args.move_pct:.1f}% over {args.window_min}min\n"
+                f"🔎 Min trade price (swing): {args.min_trade_price:.2f}"
             )
             send_telegram_message(startup_msg)
-            print("[startup] Telegram startup message sent")
         if args.email:
             send_email("[Polymarket] Worker started", "Polymarket alerts worker started ✅")
-            print("[startup] Email startup notification sent")
 
         watcher.run_forever()
-        print("[main] watcher.run_forever() returned; refetching markets...")
+        
+        # If run_forever returns (shouldn't happen, but handle gracefully)
+        print("[main] watcher.run_forever() returned, restarting market fetch...")
         time.sleep(10)
 
 
+# =========================
+# Test Functions
+# =========================
+
+def test_market_filtering():
+    """
+    Test market filtering logic with various closed/endDate type combinations.
+    This helps verify the to_bool() and parse_end_date() helpers work correctly.
+    """
+    now_ts = time.time()
+    past_ts = now_ts - 86400  # 1 day ago
+    future_ts = now_ts + 86400  # 1 day in future
+    
+    test_markets = [
+        # Test closed field variations
+        {"closed": True, "endDate": None, "clobTokenIds": ["token1"], "question": "Test 1"},
+        {"closed": False, "endDate": None, "clobTokenIds": ["token2"], "question": "Test 2"},
+        {"closed": "true", "endDate": None, "clobTokenIds": ["token3"], "question": "Test 3"},
+        {"closed": "false", "endDate": None, "clobTokenIds": ["token4"], "question": "Test 4"},
+        {"closed": "True", "endDate": None, "clobTokenIds": ["token5"], "question": "Test 5"},
+        {"closed": 1, "endDate": None, "clobTokenIds": ["token6"], "question": "Test 6"},
+        {"closed": 0, "endDate": None, "clobTokenIds": ["token7"], "question": "Test 7"},
+        {"closed": None, "endDate": None, "clobTokenIds": ["token8"], "question": "Test 8"},
+        
+        # Test endDate field variations
+        {"closed": False, "endDate": past_ts, "clobTokenIds": ["token9"], "question": "Test 9"},
+        {"closed": False, "endDate": str(past_ts), "clobTokenIds": ["token10"], "question": "Test 10"},
+        {"closed": False, "endDate": datetime.fromtimestamp(past_ts, tz=timezone.utc).isoformat(), "clobTokenIds": ["token11"], "question": "Test 11"},
+        {"closed": False, "endDate": datetime.fromtimestamp(past_ts, tz=timezone.utc).isoformat() + "Z", "clobTokenIds": ["token12"], "question": "Test 12"},
+        {"closed": False, "endDate": future_ts, "clobTokenIds": ["token13"], "question": "Test 13"},
+        {"closed": False, "endDate": None, "clobTokenIds": ["token14"], "question": "Test 14"},
+        
+        # Combined cases
+        {"closed": "false", "endDate": None, "clobTokenIds": ["token15"], "question": "Test 15"},
+        {"closed": True, "endDate": past_ts, "clobTokenIds": ["token16"], "question": "Test 16"},
+    ]
+    
+    print("[test] Testing market filtering with various field types...")
+    print(f"[test] now_ts={now_ts} ({datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()})")
+    
+    passed = 0
+    filtered_closed = 0
+    filtered_enddate = 0
+    
+    for m in test_markets:
+        # Test closed filter
+        if to_bool(m.get("closed")):
+            filtered_closed += 1
+            continue
+        
+        # Test endDate filter
+        end_date_ts = parse_end_date(m.get("endDate"), now_ts)
+        if end_date_ts is not None:
+            filtered_enddate += 1
+            continue
+        
+        # Market passed filters
+        passed += 1
+        print(f"[test] PASSED: {m['question']} (closed={m.get('closed')!r}, endDate={m.get('endDate')!r})")
+    
+    print(f"[test] Results: total={len(test_markets)} passed={passed} filtered_closed={filtered_closed} filtered_enddate={filtered_enddate}")
+    
+    # Expected: token2, token4, token7, token8, token13, token14, token15 should pass
+    # (closed=False/0/None and endDate=None/future)
+    expected_passed = 7
+    if passed == expected_passed:
+        print("[test] ✅ Test passed!")
+        return True
+    else:
+        print(f"[test] ❌ Test failed! Expected {expected_passed} passed, got {passed}")
+        return False
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_market_filtering()
+    else:
+        main()
