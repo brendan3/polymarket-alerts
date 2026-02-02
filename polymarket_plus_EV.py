@@ -125,6 +125,12 @@ def fetch_markets(per_page: int = 100, pages: int = 50) -> Tuple[Dict[str, Marke
             if not clob_ids:
                 continue
 
+            if isinstance(clob_ids, str):
+                try:
+                    clob_ids = json.loads(clob_ids)
+                except:
+                    clob_ids = [clob_ids]
+
             outcomes = m.get("outcomes") or []
             if isinstance(outcomes, str):
                 try:
