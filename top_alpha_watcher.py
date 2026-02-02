@@ -304,6 +304,8 @@ class TopAlphaWatcher:
         self.min_move_from_vwap = min_move_from_vwap
         self.max_revert = max_revert
         self.follow_through_sec = follow_through_sec
+        self.resolve_days_min = resolve_days_min
+        self.resolve_days_max = resolve_days_max
         self.heartbeat_sec = heartbeat_sec
         self.telegram = telegram
         self.logger = logger or TopAlphaLoggerSQLite()
@@ -653,7 +655,7 @@ class TopAlphaWatcher:
 
     def run(self) -> None:
         if not self.asset_ids:
-            print("[top_alpha] No eligible assets (7–45d). Consider widening resolve window or increasing Gamma pages.")
+            print(f"[top_alpha] No eligible assets ({self.resolve_days_min}–{self.resolve_days_max}d). Consider widening resolve window or increasing Gamma pages.")
             return
 
         ws_url = f"{CLOB_WS_BASE}/ws/market"
@@ -729,6 +731,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    print(f"[config] resolve_days={args.resolve_days_min}-{args.resolve_days_max}")
 
     metas, raw_count = fetch_gamma_markets(args.per_page, args.pages, active_only=True)
     print(f"[market_fetch] raw={raw_count} metas={len(metas)}")
