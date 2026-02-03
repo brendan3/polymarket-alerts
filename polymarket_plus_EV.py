@@ -614,6 +614,7 @@ class EVScanner:
         - Single trade: {"event_type": "trade", "asset_id": "...", "price": ..., "size": ...}
         - Trades array: {"event_type": "trade", "trades": [{...}, {...}]}
         - Trade object: {"trades": {...}} (single object in trades field)
+        - last_trade_price with size data
         """
         # Handle trades array format
         raw_trades = data.get("trades")
@@ -646,24 +647,38 @@ class EVScanner:
             price = safe_float(
                 trade.get("price") or 
                 trade.get("p") or 
-                trade.get("last_trade_price")
+                trade.get("last_trade_price") or
+                trade.get("value")
             )
             size = safe_float(
                 trade.get("size") or 
                 trade.get("s") or 
                 trade.get("amount") or 
-                trade.get("qty")
+                trade.get("qty") or
+                trade.get("quantity")
             )
             
-            if price is None or size is None:
+            if price is None:
                 continue
+            
+            # If size is missing, use a default minimum size for tracking purposes
+            # This allows us to track price movements even without exact size
+            # Note: sweep detection requires real size, so this is mainly for price/volume tracking
+            size_estimated = False
+            if size is None:
+                size = 1.0  # Default minimum size for price tracking
+                size_estimated = True
+                # Log first few to see if we're getting events without size
+                if self._trade_count < 3:
+                    print(f"[trade] DEBUG: Trade event missing size. Fields: {list(trade.keys())[:10]}")
 
             # Track trade events for verification
             self._trade_count += 1
             
             # Log first few trades immediately for verification
             if self._trade_count <= 5:
-                print(f"[trade] ✓ Trade #{self._trade_count}: token={token_id[:8]}... price={price:.4f} size={size:.2f}")
+                size_str = f"{size:.2f}" if not size_estimated else f"{size:.2f} (est)"
+                print(f"[trade] ✓ Trade #{self._trade_count}: token={token_id[:8]}... price={price:.4f} size={size_str}")
             
             # Log trade activity periodically (every 60 seconds)
             now = time.time()
@@ -730,8 +745,13 @@ class EVScanner:
                 # Handle trade events (explicit or inferred)
                 elif event_type == "trade" or it.get("trades") is not None:
                     self._handle_trade(it)
-                # Handle price updates
-                elif event_type in ("price_change", "last_trade_price"):
+                # Handle last_trade_price - always try as trade (will use estimated size if missing)
+                elif event_type == "last_trade_price":
+                    # Try to handle as trade first (handles missing size gracefully)
+                    # This allows us to track price movements as potential trades
+                    self._handle_trade(it)
+                # Handle price_change (pure price updates, no trade data)
+                elif event_type == "price_change":
                     token_id = it.get("asset_id") or it.get("token_id")
                     price = safe_float(it.get("price") or it.get("value"))
                     if token_id and price is not None:
