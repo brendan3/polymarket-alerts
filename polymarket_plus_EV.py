@@ -548,6 +548,8 @@ class EVScanner:
         self.whale_detector = WhaleOrderDetector(markets)
 
         self._last_msg_ts = time.time()
+        self._trade_count = 0  # Track trade events received for verification
+        self._last_trade_log_ts = time.time()
 
     def _alert(self, msg: str) -> None:
         print(f"\n{'='*60}\n{msg}\n{'='*60}\n")
@@ -605,21 +607,70 @@ class EVScanner:
                 self._alert(alert)
 
     def _handle_trade(self, data: Dict[str, Any]) -> None:
-        token_id = data.get("asset_id") or data.get("token_id") or data.get("market")
-        if not token_id or token_id not in self.markets:
-            return
+        """
+        Handle trade events. Supports multiple formats:
+        - Single trade: {"event_type": "trade", "asset_id": "...", "price": ..., "size": ...}
+        - Trades array: {"event_type": "trade", "trades": [{...}, {...}]}
+        - Trade object: {"trades": {...}} (single object in trades field)
+        """
+        # Handle trades array format
+        raw_trades = data.get("trades")
+        trades: List[Dict[str, Any]] = []
+        
+        if isinstance(raw_trades, list):
+            trades = [t for t in raw_trades if isinstance(t, dict)]
+        elif isinstance(raw_trades, dict):
+            trades = [raw_trades]
+        else:
+            # If no trades array, treat the payload itself as a single trade
+            if any(k in data for k in ("asset_id", "token_id", "market", "assetId", "price", "p", "size", "s", "amount", "qty")):
+                trades = [data]
+        
+        # Process each trade
+        for trade in trades:
+            token_id = (
+                trade.get("asset_id") or 
+                trade.get("token_id") or 
+                trade.get("market") or 
+                trade.get("assetId") or
+                data.get("asset_id") or 
+                data.get("token_id") or 
+                data.get("market")
+            )
+            
+            if not token_id or token_id not in self.markets:
+                continue
 
-        price = safe_float(data.get("price") or data.get("p"))
-        size = safe_float(data.get("size") or data.get("s") or data.get("amount"))
-        if price is None or size is None:
-            return
+            price = safe_float(
+                trade.get("price") or 
+                trade.get("p") or 
+                trade.get("last_trade_price")
+            )
+            size = safe_float(
+                trade.get("size") or 
+                trade.get("s") or 
+                trade.get("amount") or 
+                trade.get("qty")
+            )
+            
+            if price is None or size is None:
+                continue
 
-        notional = price * size
-        self.stale_detector.add_volume(token_id, notional)
-        self.complement_detector.update_price(token_id, price)
+            # Track trade events for verification
+            self._trade_count += 1
+            
+            # Log trade activity periodically (every 60 seconds)
+            now = time.time()
+            if now - self._last_trade_log_ts >= 60:
+                print(f"[trade] Processed {self._trade_count} trade events total")
+                self._last_trade_log_ts = now
 
-        if alert := self.sweep_detector.add_trade(token_id, price, size):
-            self._alert(alert)
+            notional = price * size
+            self.stale_detector.add_volume(token_id, notional)
+            self.complement_detector.update_price(token_id, price)
+
+            if alert := self.sweep_detector.add_trade(token_id, price, size):
+                self._alert(alert)
 
     def _handle_price(self, token_id: str, price: float) -> None:
         if token_id not in self.markets:
@@ -661,15 +712,23 @@ class EVScanner:
                     continue
 
                 event_type = it.get("event_type", "")
+                
+                # Handle book updates
                 if event_type == "book":
                     self._handle_book(it)
-                elif event_type == "trade":
+                # Handle trade events (explicit or inferred)
+                elif event_type == "trade" or it.get("trades") is not None:
                     self._handle_trade(it)
+                # Handle price updates
                 elif event_type in ("price_change", "last_trade_price"):
                     token_id = it.get("asset_id") or it.get("token_id")
                     price = safe_float(it.get("price") or it.get("value"))
                     if token_id and price is not None:
                         self._handle_price(token_id, price)
+                # Fallback: check if payload looks like a trade (has trade-like fields but no event_type)
+                elif not event_type and any(k in it for k in ("asset_id", "token_id", "market", "assetId")) and any(k in it for k in ("price", "p", "size", "s", "amount", "qty")):
+                    # Might be a trade event without explicit event_type
+                    self._handle_trade(it)
 
         def on_error(ws, err):
             print(f"[ws error] {err}")
