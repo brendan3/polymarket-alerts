@@ -449,21 +449,21 @@ class StaleQuoteDetector:
 
 class WhaleOrderDetector:
     """
-    Detect large orders sitting in the book.
-    Filtered to ignore extreme prices (near 0 or 1) that cause noise.
+    Tuned for Alpha: Detects significant market-defining orders.
+    Ignores retail 'large' orders and passive liquidity reward farmers.
     """
 
     def __init__(
         self,
         markets: Dict[str, Market],
-        min_order_size: float = 10000,  # $10k+ order
-        min_size_vs_depth: float = 0.3,  # Order is 30%+ of visible depth
+        min_order_size: float = 30000,  # Raised from $10k to $30k for higher signal
+        min_size_vs_depth: float = 0.5,  # Raised from 30% to 50% of the book
     ):
         self.markets = markets
         self.min_order_size = min_order_size
         self.min_size_vs_depth = min_size_vs_depth
         self.last_alert: Dict[str, float] = {}
-        self.alert_cooldown = 600
+        self.alert_cooldown = 900 # Increased to 15 mins to prevent flapping
 
     def check_book(self, token_id: str, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> Optional[str]:
         if token_id not in self.markets:
@@ -475,16 +475,16 @@ class WhaleOrderDetector:
 
         alerts = []
         
-        # We loop through both sides in one go for efficiency
         for side, levels in [("BID", bids), ("ASK", asks)]:
-            # Calculate total depth within the 'Alpha Zone' (0.10 - 0.90)
-            valid_levels = [ (p, s) for p, s in levels if 0.10 <= p <= 0.90 ]
+            # ALPHA FILTER: Only look at the "Meat" of the book (0.15 - 0.85)
+            # This ignores the $100k+ orders sitting at 0.90/0.10 for rewards
+            valid_levels = [ (p, s) for p, s in levels if 0.15 <= p <= 0.85 ]
             total_depth = sum(p * s for p, s in valid_levels)
             
             for price, size in valid_levels:
                 notional = price * size
-                # Trigger if order is large enough AND a significant % of the book
                 if notional >= self.min_order_size:
+                    # Is this order defining the book?
                     if total_depth > 0 and notional / total_depth >= self.min_size_vs_depth:
                         alerts.append((side, price, size, notional, total_depth))
 
@@ -495,14 +495,13 @@ class WhaleOrderDetector:
         market = self.markets[token_id]
         outcome = market.outcome_for_token(token_id)
 
-        lines = [f"🐋 WHALE ORDER: {market.question[:60]}", f"Outcome: {outcome}", ""]
+        lines = [f"🐋 ALPHA WHALE: {market.question[:60]}", f"Outcome: {outcome}", ""]
         for side, price, size, notional, total_depth in alerts:
             pct_of_depth = (notional / total_depth) * 100
             lines.append(f"  {side} @ {price:.3f}: ${notional:,.0f} ({pct_of_depth:.0f}% of depth)")
         lines.append(f"\n{market.url()}")
 
         return "\n".join(lines)
-
 # -------------------------
 # Main Scanner
 # -------------------------
