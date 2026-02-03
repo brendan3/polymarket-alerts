@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -44,6 +45,11 @@ def safe_float(x: Any) -> Optional[float]:
         return float(x) if x is not None else None
     except Exception:
         return None
+
+
+def alpha_score(notional: float, pct_of_depth: float) -> float:
+    """Calculate alpha score: (pct_of_depth / 100.0) * log10(notional + 1.0) * 100.0"""
+    return (pct_of_depth / 100.0) * math.log10(notional + 1.0) * 100.0
 
 
 def send_telegram(body: str) -> None:
@@ -491,14 +497,30 @@ class WhaleOrderDetector:
         if not alerts:
             return None
 
+        # Calculate alpha_score for each alert and filter to only high-signal alerts (>= 400)
+        scored_alerts = []
+        for side, price, size, notional, total_depth in alerts:
+            pct_of_depth = (notional / total_depth) * 100 if total_depth > 0 else 0.0
+            score = alpha_score(notional, pct_of_depth)
+            if score >= 400:
+                scored_alerts.append((side, price, size, notional, total_depth, pct_of_depth, score))
+
+        if not scored_alerts:
+            return None
+
+        # Only show the best alert per market (highest alpha_score) to reduce spam
+        best = max(scored_alerts, key=lambda t: t[6])  # t[6] is the score
+        scored_alerts = [best]
+
         self.last_alert[token_id] = now
         market = self.markets[token_id]
         outcome = market.outcome_for_token(token_id)
 
         lines = [f"🐋 ALPHA WHALE: {market.question[:60]}", f"Outcome: {outcome}", ""]
-        for side, price, size, notional, total_depth in alerts:
-            pct_of_depth = (notional / total_depth) * 100
-            lines.append(f"  {side} @ {price:.3f}: ${notional:,.0f} ({pct_of_depth:.0f}% of depth)")
+        for side, price, size, notional, total_depth, pct_of_depth, score in scored_alerts:
+            lines.append(
+                f"  {side} @ {price:.3f}: ${notional:,.0f} ({pct_of_depth:.0f}% depth) | alpha_score={score:.1f}"
+            )
         lines.append(f"\n{market.url()}")
 
         return "\n".join(lines)
