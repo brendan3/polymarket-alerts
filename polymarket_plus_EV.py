@@ -173,20 +173,16 @@ def fetch_markets(per_page: int = 100, pages: int = 50) -> Tuple[Dict[str, Marke
 class ComplementArbitrageDetector:
     """
     Detects when mutually exclusive outcomes don't sum to ~100%.
-    
-    Example: If "Candidate A wins" = 45% and "Candidate B wins" = 45% and "Other" = 15%,
-    that's 105% total. You can SHORT all three for guaranteed profit (minus fees).
-    
-    If total < 100%, you can LONG all outcomes.
+    Modified to alert immediately if current known prices > 100%.
     """
 
     def __init__(self, events: Dict[str, EventGroup], min_edge_pct: float = 3.0, min_liquidity: float = 5000):
         self.events = events
-        self.min_edge_pct = min_edge_pct  # Alert if sum deviates by this much from 100%
+        self.min_edge_pct = min_edge_pct  
         self.min_liquidity = min_liquidity
-        self.prices: Dict[str, float] = {}  # token_id -> last price (YES price)
+        self.prices: Dict[str, float] = {}  # token_id -> last price
         self.last_alert: Dict[str, float] = {}  # event_slug -> timestamp
-        self.alert_cooldown = 300  # 5 minutes between alerts per event
+        self.alert_cooldown = 300  
 
     def update_price(self, token_id: str, price: float) -> None:
         self.prices[token_id] = price
@@ -201,39 +197,48 @@ class ComplementArbitrageDetector:
 
         event = self.events[event_slug]
         if len(event.markets) < 2:
-            return None  # Need multiple outcomes
+            return None
 
-        # For multi-outcome events, sum the YES prices of each outcome
-        # Each market should have YES as first token
         total_prob = 0.0
         outcome_prices: List[Tuple[str, float]] = []
-        missing = False
+        missing_any = False
 
         for market in event.markets:
             if not market.clob_token_ids:
                 continue
-            yes_token = market.clob_token_ids[0]  # Typically YES is first
+            yes_token = market.clob_token_ids[0]
             if yes_token not in self.prices:
-                missing = True
+                missing_any = True
                 continue
+            
             price = self.prices[yes_token]
             total_prob += price
             outcome_name = market.outcomes[0] if market.outcomes else market.question[:30]
             outcome_prices.append((outcome_name, price))
 
-        if missing or len(outcome_prices) < 2:
-            return None
+        # --- ALPHA LOGIC ---
+        # 1. OVERPRICED: If sum > 100%, it's an alert even if tokens are missing.
+        # 2. UNDERPRICED: If sum < 100%, we ONLY alert if we have ALL prices.
+        
+        is_arb = False
+        direction = ""
+        
+        if total_prob > (1.0 + (self.min_edge_pct / 100)):
+            is_arb = True
+            direction = "OVERPRICED (short all)"
+        elif not missing_any and total_prob < (1.0 - (self.min_edge_pct / 100)):
+            is_arb = True
+            direction = "UNDERPRICED (long all)"
 
-        deviation = abs(total_prob - 1.0) * 100  # as percentage
-
-        if deviation >= self.min_edge_pct:
+        if is_arb:
             self.last_alert[event_slug] = now
-            direction = "OVERPRICED (short all)" if total_prob > 1.0 else "UNDERPRICED (long all)"
+            deviation = abs(total_prob - 1.0) * 100
             
             lines = [
                 f"⚡ COMPLEMENT ARB: {event.event_title}",
                 f"Total implied prob: {total_prob*100:.1f}% ({direction})",
                 f"Edge: {deviation:.1f}%",
+                f"Status: {'Partial Data' if missing_any else 'Full Event Data'}",
                 "",
             ]
             for name, price in outcome_prices:
@@ -272,9 +277,9 @@ class EarlySweepDetector:
     def __init__(
         self,
         markets: Dict[str, Market],
-        window_sec: int = 30,  # Shorter window = earlier detection
-        min_trades: int = 3,
-        min_notional: float = 5000,
+        window_sec: int = 10,  # Shorter window = earlier detection
+        min_trades: int = 2,
+        min_notional: float = 1000,
         min_avg_size: float = 500,  # Filter out small retail trades
     ):
         self.markets = markets
@@ -445,11 +450,7 @@ class StaleQuoteDetector:
 class WhaleOrderDetector:
     """
     Detect large orders sitting in the book.
-    
-    Large resting orders can indicate:
-    - Where institutional players expect price to go
-    - Support/resistance levels
-    - Potential for price magnet effect
+    Filtered to ignore extreme prices (near 0 or 1) that cause noise.
     """
 
     def __init__(
@@ -473,22 +474,19 @@ class WhaleOrderDetector:
             return None
 
         alerts = []
-
-        # Check bids
-        total_bid_depth = sum(p * s for p, s in bids)
-        for price, size in bids:
-            notional = price * size
-            if notional >= self.min_order_size:
-                if total_bid_depth > 0 and notional / total_bid_depth >= self.min_size_vs_depth:
-                    alerts.append(("BID", price, size, notional))
-
-        # Check asks
-        total_ask_depth = sum(p * s for p, s in asks)
-        for price, size in asks:
-            notional = price * size
-            if notional >= self.min_order_size:
-                if total_ask_depth > 0 and notional / total_ask_depth >= self.min_size_vs_depth:
-                    alerts.append(("ASK", price, size, notional))
+        
+        # We loop through both sides in one go for efficiency
+        for side, levels in [("BID", bids), ("ASK", asks)]:
+            # Calculate total depth within the 'Alpha Zone' (0.10 - 0.90)
+            valid_levels = [ (p, s) for p, s in levels if 0.10 <= p <= 0.90 ]
+            total_depth = sum(p * s for p, s in valid_levels)
+            
+            for price, size in valid_levels:
+                notional = price * size
+                # Trigger if order is large enough AND a significant % of the book
+                if notional >= self.min_order_size:
+                    if total_depth > 0 and notional / total_depth >= self.min_size_vs_depth:
+                        alerts.append((side, price, size, notional, total_depth))
 
         if not alerts:
             return None
@@ -498,13 +496,12 @@ class WhaleOrderDetector:
         outcome = market.outcome_for_token(token_id)
 
         lines = [f"🐋 WHALE ORDER: {market.question[:60]}", f"Outcome: {outcome}", ""]
-        for side, price, size, notional in alerts:
-            pct_of_depth = notional / (total_bid_depth if side == "BID" else total_ask_depth) * 100
-            lines.append(f"  {side} @ {price:.3f}: ${notional:,.0f} ({pct_of_depth:.0f}% of {side.lower()} depth)")
+        for side, price, size, notional, total_depth in alerts:
+            pct_of_depth = (notional / total_depth) * 100
+            lines.append(f"  {side} @ {price:.3f}: ${notional:,.0f} ({pct_of_depth:.0f}% of depth)")
         lines.append(f"\n{market.url()}")
 
         return "\n".join(lines)
-
 
 # -------------------------
 # Main Scanner
