@@ -457,7 +457,7 @@ class WhaleOrderDetector:
         self,
         markets: Dict[str, Market],
         min_order_size: float = 30000,  # Raised from $10k to $30k for higher signal
-        min_size_vs_depth: float = 0.5,  # Raised from 30% to 50% of the book
+        min_size_vs_depth: float = 0.6,  # Raised from 30% to 50% of the book
     ):
         self.markets = markets
         self.min_order_size = min_order_size
