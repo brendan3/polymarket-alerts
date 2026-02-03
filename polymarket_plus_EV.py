@@ -550,6 +550,8 @@ class EVScanner:
         self._last_msg_ts = time.time()
         self._trade_count = 0  # Track trade events received for verification
         self._last_trade_log_ts = time.time()
+        self._start_time = time.time()  # Track start time for rate calculation
+        self._event_type_counts: Dict[str, int] = defaultdict(int)  # Track event types for verification
 
     def _alert(self, msg: str) -> None:
         print(f"\n{'='*60}\n{msg}\n{'='*60}\n")
@@ -659,10 +661,16 @@ class EVScanner:
             # Track trade events for verification
             self._trade_count += 1
             
+            # Log first few trades immediately for verification
+            if self._trade_count <= 5:
+                print(f"[trade] ✓ Trade #{self._trade_count}: token={token_id[:8]}... price={price:.4f} size={size:.2f}")
+            
             # Log trade activity periodically (every 60 seconds)
             now = time.time()
             if now - self._last_trade_log_ts >= 60:
-                print(f"[trade] Processed {self._trade_count} trade events total")
+                elapsed_min = (now - self._start_time) / 60.0
+                rate = self._trade_count / max(1, elapsed_min)
+                print(f"[trade] Processed {self._trade_count} trade events total (~{rate:.1f}/min)")
                 self._last_trade_log_ts = now
 
             notional = price * size
@@ -698,6 +706,7 @@ class EVScanner:
             ws.send(json.dumps({"type": "market", "assets_ids": subscribe_ids}))
             print(f"[ws] Subscribed to {len(subscribe_ids)} tokens")
             print(f"[scanner] Monitoring {len(self.events)} events for complement arb")
+            print(f"[trade] Trade handling enabled - will log first 5 trades for verification")
 
         def on_message(ws, msg):
             self._last_msg_ts = time.time()
@@ -712,6 +721,8 @@ class EVScanner:
                     continue
 
                 event_type = it.get("event_type", "")
+                event_type_key = event_type or "no_type"
+                self._event_type_counts[event_type_key] += 1
                 
                 # Handle book updates
                 if event_type == "book":
@@ -729,6 +740,10 @@ class EVScanner:
                 elif not event_type and any(k in it for k in ("asset_id", "token_id", "market", "assetId")) and any(k in it for k in ("price", "p", "size", "s", "amount", "qty")):
                     # Might be a trade event without explicit event_type
                     self._handle_trade(it)
+            
+            # Log event type summary periodically (every 5 minutes)
+            if sum(self._event_type_counts.values()) % 1000 == 0 and sum(self._event_type_counts.values()) > 0:
+                print(f"[ws] Event type summary: {dict(self._event_type_counts)} | Trades processed: {self._trade_count}")
 
         def on_error(ws, err):
             print(f"[ws error] {err}")
