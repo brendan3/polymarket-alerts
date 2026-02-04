@@ -283,9 +283,9 @@ class EarlySweepDetector:
     def __init__(
         self,
         markets: Dict[str, Market],
-        window_sec: int = 10,  # Shorter window = earlier detection
-        min_trades: int = 2,
-        min_notional: float = 1000,
+        window_sec: int = 20,  # Shorter window = earlier detection
+        min_trades: int = 3,
+        min_notional: float = 25000,
         min_avg_size: float = 500,  # Filter out small retail trades
     ):
         self.markets = markets
