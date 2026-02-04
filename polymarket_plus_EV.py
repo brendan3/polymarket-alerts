@@ -669,6 +669,11 @@ class WhaleOrderDetector:
         # Only show the best wall per market (highest setup_score)
         best = max(actionable_walls, key=lambda w: w["setup_score"])
         
+        # Gate by minimum setup score threshold
+        min_setup = float(os.getenv("MIN_SETUP_SCORE", "300"))
+        if best["setup_score"] < min_setup:
+            return None
+        
         self.last_alert[token_id] = now
         market = self.markets[token_id]
         outcome = market.outcome_for_token(token_id)
