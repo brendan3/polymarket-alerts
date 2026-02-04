@@ -453,25 +453,118 @@ class StaleQuoteDetector:
 # Strategy 4: Large Resting Order Detection
 # -------------------------
 
+@dataclass
+class WallState:
+    """Tracks lifecycle of a wall (large resting order)"""
+    first_seen_ts: float
+    last_seen_ts: float
+    peak_notional: float
+    peak_pct_depth: float
+    refresh_count: int  # Number of times size replenished after trades
+    last_size: float
+    price: float
+    side: str  # "BID" or "ASK"
+    
+    def time_at_level(self, now: float) -> float:
+        """Returns time in seconds the wall has persisted at this price"""
+        return now - self.first_seen_ts
+    
+    def update(self, now: float, notional: float, pct_depth: float, size: float) -> None:
+        """Update wall state - detects refresh if size increased"""
+        self.last_seen_ts = now
+        if notional > self.peak_notional:
+            self.peak_notional = notional
+        if pct_depth > self.peak_pct_depth:
+            self.peak_pct_depth = pct_depth
+        # Detect refresh: size increased after being reduced
+        if size > self.last_size * 1.1:  # 10% increase = refresh
+            self.refresh_count += 1
+        self.last_size = size
+
+
+def setup_score(
+    alpha_score: float,
+    distance_to_mid: float,
+    spread: float,
+    persistence_min: float,
+    refresh_count: int,
+    pct_depth: float,
+) -> float:
+    """
+    Convert alpha_score to actionable setup_score.
+    
+    Factors:
+    - Proximity to mid (critical for actionability)
+    - Spread (wide spread = less actionable)
+    - Persistence (walls that persist are more informed)
+    - Refresh (walls that refresh are actively maintained)
+    """
+    # Proximity penalty: walls far from mid are less actionable
+    distance_penalty = 1.0 - min(distance_to_mid / 0.10, 1.0)  # 0.10 = 10¢ max distance
+    
+    # Spread penalty: wide spreads reduce actionability
+    spread_penalty = 1.0 - min(spread / 0.05, 1.0)  # 0.05 = 5¢ max spread
+    
+    # Persistence multiplier: 1.0 → 1.5 based on time at level
+    persistence_mult = 1.0 + min(persistence_min / 120.0, 0.5)  # Max 1.5x at 120s+
+    
+    # Refresh multiplier: 1.0 → 1.8 based on refresh count
+    refresh_mult = 1.0 + min(refresh_count / 2.0, 0.8)  # Max 1.8x at 2+ refreshes
+    
+    setup = (
+        alpha_score
+        * distance_penalty
+        * spread_penalty
+        * persistence_mult
+        * refresh_mult
+    )
+    
+    return setup
+
+
 class WhaleOrderDetector:
     """
-    Tuned for Alpha: Detects significant market-defining orders.
-    Ignores retail 'large' orders and passive liquidity reward farmers.
+    Wall Lifecycle Tracker: Detects informed walls that persist and refresh.
+    
+    Tracks walls over time to separate:
+    - Informed walls (persist + refresh)
+    - Spoof/anchors (appear, pull quickly)
+    - Passive liquidity (stable but far from mid)
     """
 
     def __init__(
         self,
         markets: Dict[str, Market],
-        min_order_size: float = 30000,  # Raised from $10k to $30k for higher signal
-        min_size_vs_depth: float = 0.6,  # Raised from 30% to 50% of the book
+        min_order_size: float = 30000,
+        min_size_vs_depth: float = 0.6,
+        min_persistence_sec: float = 120.0,  # 2 minutes
+        min_refresh_count: int = 2,
+        min_dominant_pct: float = 70.0,
     ):
         self.markets = markets
         self.min_order_size = min_order_size
         self.min_size_vs_depth = min_size_vs_depth
+        self.min_persistence_sec = min_persistence_sec
+        self.min_refresh_count = min_refresh_count
+        self.min_dominant_pct = min_dominant_pct
+        
+        # Wall lifecycle tracking: (token_id, side, price) -> WallState
+        self.walls: Dict[Tuple[str, str, float], WallState] = {}
         self.last_alert: Dict[str, float] = {}
-        self.alert_cooldown = 900 # Increased to 15 mins to prevent flapping
+        self.alert_cooldown = 900  # 15 minutes
 
-    def check_book(self, token_id: str, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> Optional[str]:
+    def check_book(
+        self,
+        token_id: str,
+        bids: List[Tuple[float, float]],
+        asks: List[Tuple[float, float]],
+        mid: Optional[float] = None,
+        spread: Optional[float] = None,
+    ) -> Optional[str]:
+        """
+        Check book for walls and track their lifecycle.
+        Only alert on actionable walls (PERSISTED, REFRESHED, or DOMINANT).
+        """
         if token_id not in self.markets:
             return None
 
@@ -479,50 +572,128 @@ class WhaleOrderDetector:
         if token_id in self.last_alert and (now - self.last_alert[token_id]) < self.alert_cooldown:
             return None
 
-        alerts = []
+        # Calculate mid and spread if not provided
+        if mid is None or spread is None:
+            if not bids or not asks:
+                return None
+            best_bid = max(p for p, _ in bids)
+            best_ask = min(p for p, _ in asks)
+            mid = (best_bid + best_ask) / 2
+            spread = best_ask - best_bid
+
+        # Track current walls and detect new/disappeared ones
+        current_wall_keys: Set[Tuple[str, str, float]] = set()
+        actionable_walls = []
         
         for side, levels in [("BID", bids), ("ASK", asks)]:
             # ALPHA FILTER: Only look at the "Meat" of the book (0.15 - 0.85)
-            # This ignores the $100k+ orders sitting at 0.90/0.10 for rewards
-            valid_levels = [ (p, s) for p, s in levels if 0.15 <= p <= 0.85 ]
+            valid_levels = [(p, s) for p, s in levels if 0.15 <= p <= 0.85]
             total_depth = sum(p * s for p, s in valid_levels)
             
             for price, size in valid_levels:
                 notional = price * size
-                if notional >= self.min_order_size:
-                    # Is this order defining the book?
-                    if total_depth > 0 and notional / total_depth >= self.min_size_vs_depth:
-                        alerts.append((side, price, size, notional, total_depth))
-
-        if not alerts:
+                if notional < self.min_order_size:
+                    continue
+                
+                if total_depth == 0:
+                    continue
+                
+                pct_of_depth = (notional / total_depth) * 100
+                if pct_of_depth < self.min_size_vs_depth * 100:
+                    continue
+                
+                # Wall key: (token_id, side, price)
+                wall_key = (token_id, side, price)
+                current_wall_keys.add(wall_key)
+                
+                # Update or create wall state
+                if wall_key in self.walls:
+                    wall = self.walls[wall_key]
+                    wall.update(now, notional, pct_of_depth, size)
+                else:
+                    # New wall detected
+                    self.walls[wall_key] = WallState(
+                        first_seen_ts=now,
+                        last_seen_ts=now,
+                        peak_notional=notional,
+                        peak_pct_depth=pct_of_depth,
+                        refresh_count=0,
+                        last_size=size,
+                        price=price,
+                        side=side,
+                    )
+                    wall = self.walls[wall_key]
+                
+                # Check actionability filters
+                time_at_level = wall.time_at_level(now)
+                is_persisted = time_at_level >= self.min_persistence_sec
+                is_refreshed = wall.refresh_count >= self.min_refresh_count
+                is_dominant = pct_of_depth >= self.min_dominant_pct
+                
+                # Only alert if wall meets actionability criteria
+                if is_persisted or is_refreshed or is_dominant:
+                    # Calculate scores
+                    alpha = alpha_score(notional, pct_of_depth)
+                    if alpha < 400:  # Still need minimum alpha_score
+                        continue
+                    
+                    distance_to_mid = abs(price - mid)
+                    persistence_min = time_at_level / 60.0  # Convert to minutes
+                    setup = setup_score(
+                        alpha, distance_to_mid, spread, persistence_min, wall.refresh_count, pct_of_depth
+                    )
+                    
+                    actionable_walls.append({
+                        "wall": wall,
+                        "side": side,
+                        "price": price,
+                        "size": size,
+                        "notional": notional,
+                        "pct_depth": pct_of_depth,
+                        "alpha_score": alpha,
+                        "setup_score": setup,
+                        "is_persisted": is_persisted,
+                        "is_refreshed": is_refreshed,
+                        "is_dominant": is_dominant,
+                        "time_at_level": time_at_level,
+                    })
+        
+        # Clean up walls that disappeared (pull events)
+        disappeared_walls = set(self.walls.keys()) - current_wall_keys
+        for wall_key in disappeared_walls:
+            del self.walls[wall_key]
+        
+        if not actionable_walls:
             return None
-
-        # Calculate alpha_score for each alert and filter to only high-signal alerts (>= 400)
-        scored_alerts = []
-        for side, price, size, notional, total_depth in alerts:
-            pct_of_depth = (notional / total_depth) * 100 if total_depth > 0 else 0.0
-            score = alpha_score(notional, pct_of_depth)
-            if score >= 400:
-                scored_alerts.append((side, price, size, notional, total_depth, pct_of_depth, score))
-
-        if not scored_alerts:
-            return None
-
-        # Only show the best alert per market (highest alpha_score) to reduce spam
-        best = max(scored_alerts, key=lambda t: t[6])  # t[6] is the score
-        scored_alerts = [best]
-
+        
+        # Only show the best wall per market (highest setup_score)
+        best = max(actionable_walls, key=lambda w: w["setup_score"])
+        
         self.last_alert[token_id] = now
         market = self.markets[token_id]
         outcome = market.outcome_for_token(token_id)
-
-        lines = [f"🐋 ALPHA WHALE: {market.question[:60]}", f"Outcome: {outcome}", ""]
-        for side, price, size, notional, total_depth, pct_of_depth, score in scored_alerts:
-            lines.append(
-                f"  {side} @ {price:.3f}: ${notional:,.0f} ({pct_of_depth:.0f}% depth) | alpha_score={score:.1f}"
-            )
-        lines.append(f"\n{market.url()}")
-
+        
+        # Build actionability signal string
+        signals = []
+        if best["is_persisted"]:
+            signals.append(f"PERSISTED ({best['time_at_level']:.0f}s)")
+        if best["is_refreshed"]:
+            signals.append(f"REFRESHED ({best['wall'].refresh_count}x)")
+        if best["is_dominant"]:
+            signals.append(f"DOMINANT ({best['pct_depth']:.0f}%)")
+        signal_str = " | ".join(signals) if signals else "NEW"
+        
+        lines = [
+            f"🐋 ALPHA WHALE: {market.question[:60]}",
+            f"Outcome: {outcome}",
+            "",
+            f"  {best['side']} @ {best['price']:.3f}: ${best['notional']:,.0f} ({best['pct_depth']:.0f}% depth)",
+            f"  Setup Score: {best['setup_score']:.1f} (alpha={best['alpha_score']:.1f})",
+            f"  Signals: {signal_str}",
+            f"  Distance to mid: {abs(best['price'] - mid)*100:.1f}¢ | Spread: {spread*100:.1f}¢",
+            f"\n{market.url()}",
+        ]
+        
         return "\n".join(lines)
 # -------------------------
 # Main Scanner
@@ -599,7 +770,7 @@ class EVScanner:
         if alert := self.stale_detector.update_spread(token_id, spread):
             self._alert(alert)
 
-        if alert := self.whale_detector.check_book(token_id, bids, asks):
+        if alert := self.whale_detector.check_book(token_id, bids, asks, mid=mid, spread=spread):
             self._alert(alert)
 
         # Check complement arbitrage for this market's event
