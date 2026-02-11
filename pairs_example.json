@@ -1,0 +1,11 @@
+[
+  {
+    "name": "Example: Fed Chair nominee",
+    "kalshi_ticker": "KXFEDCHAIR-26",
+    "kalshi_close_time_iso": "2026-01-31T23:59:59Z",
+    "poly_yes_token_id": "REPLACE_WITH_POLYMARKET_YES_CLOB_TOKEN_ID",
+    "poly_no_token_id": "REPLACE_WITH_POLYMARKET_NO_CLOB_TOKEN_ID",
+    "poly_end_date_iso": "2026-01-31",
+    "equivalence_grade": "A"
+  }
+]
