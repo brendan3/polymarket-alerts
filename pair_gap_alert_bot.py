@@ -255,6 +255,20 @@ def locked_payout_edge(
 async def run(cfg: BotConfig, pairs: List[PairSpec]) -> None:
     dedupe = AlertDeduper(ttl_seconds=60)
     async with aiohttp.ClientSession() as session:
+        # Startup notification to Telegram: how many pairs and which ones
+        try:
+            summary_lines = [
+                f"Pair gap alert bot online. Tracking {len(pairs)} pairs:",
+                "",
+            ] + [
+                f"- {p.name} (Kalshi {p.kalshi_ticker})"
+                for p in pairs
+            ]
+            await send_telegram(cfg, "\n".join(summary_lines), session)
+        except Exception:
+            # Don't kill the bot if the intro message fails
+            pass
+
         while True:
             start = time.time()
             for pair in pairs:

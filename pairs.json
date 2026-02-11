@@ -25,5 +25,23 @@
     "poly_no_token_id": "REPLACE_WITH_POLY_NO_TOKEN_ID_FOR_WARSH_CONFIRMED_BY_MAY15",
     "poly_end_date_iso": "2026-05-15",
     "equivalence_grade": "B"
+  },
+  {
+    "name": "US confirms aliens exist before 2027",
+    "kalshi_ticker": "KXALIENS-27",
+    "kalshi_close_time_iso": "2026-12-31T23:59:59Z",
+    "poly_yes_token_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+    "poly_no_token_id": "7305630249804085635496399869905769372294302716159034447326228509068694952392",
+    "poly_end_date_iso": "2026-12-31",
+    "equivalence_grade": "A"
+  },
+  {
+    "name": "Another US government shutdown by Feb 14, 2026",
+    "kalshi_ticker": "KXGOVTSHUTDOWN-26FEB14",
+    "kalshi_close_time_iso": "2026-02-14T23:59:59Z",
+    "poly_yes_token_id": "7648925155044397287047798308912067661131447591491670430094875295487039626662",
+    "poly_no_token_id": "43946269812975261940442841140057396362355013850035195910637438338242851933505",
+    "poly_end_date_iso": "2026-02-14",
+    "equivalence_grade": "A"
   }
 ]
