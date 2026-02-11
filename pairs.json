@@ -1,0 +1,29 @@
+[
+  {
+    "name": "House control after 2026 election (Dem wins?)",
+    "kalshi_ticker": "CONTROLH-2026",
+    "kalshi_close_time_iso": "2026-11-03T23:59:59Z",
+    "poly_yes_token_id": "83247781037352156539108067944461291821683755894607244160607042790356561625563",
+    "poly_no_token_id": "33156410999665902694791064431724433042010245771106314074312009703157423879038",
+    "poly_end_date_iso": "2026-11-03",
+    "equivalence_grade": "A"
+  },
+  {
+    "name": "Senate control after 2026 election (GOP wins?)",
+    "kalshi_ticker": "CONTROLS-2026",
+    "kalshi_close_time_iso": "2026-11-03T23:59:59Z",
+    "poly_yes_token_id": "51939490109676186832507970701169130490548061087912630009168726706475001411420",
+    "poly_no_token_id": "108587038225191871355030577171066853142535232042155117887981453750193713427381",
+    "poly_end_date_iso": "2026-11-03",
+    "equivalence_grade": "A"
+  },
+  {
+    "name": "Warsh confirmed as Fed Chair by May 15",
+    "kalshi_ticker": "KXFEDCHAIRCONFIRMED",
+    "kalshi_close_time_iso": "2026-05-15T23:59:59Z",
+    "poly_yes_token_id": "REPLACE_WITH_POLY_YES_TOKEN_ID_FOR_WARSH_CONFIRMED_BY_MAY15",
+    "poly_no_token_id": "REPLACE_WITH_POLY_NO_TOKEN_ID_FOR_WARSH_CONFIRMED_BY_MAY15",
+    "poly_end_date_iso": "2026-05-15",
+    "equivalence_grade": "B"
+  }
+]
