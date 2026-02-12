@@ -66,7 +66,7 @@ class BotConfig:
 
 
 class AlertDeduper:
-    def __init__(self, ttl_seconds: float = 60.0):
+    def __init__(self, ttl_seconds: float = 300.0):
         self.ttl = ttl_seconds
         self._seen: Dict[str, float] = {}
 
@@ -253,7 +253,7 @@ def locked_payout_edge(
 # ----------------------------
 
 async def run(cfg: BotConfig, pairs: List[PairSpec]) -> None:
-    dedupe = AlertDeduper(ttl_seconds=60)
+    dedupe = AlertDeduper(ttl_seconds=300)
     async with aiohttp.ClientSession() as session:
         # Startup notification to Telegram: how many pairs and which ones
         try:

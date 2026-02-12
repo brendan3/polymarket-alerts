@@ -50,6 +50,10 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 PAIR_SLUGS: Dict[str, str] = {
     "CONTROLH-2026": "will-the-democratic-party-control-the-house-after-the-2026-midterm-elections",
     "CONTROLS-2026": "will-the-republican-party-control-the-senate-after-the-2026-midterm-elections",
+    "KXRECSSNBER-26": "us-recession-by-end-of-2026",
+    "KXSHUTDOWNBY-26DEC31": "will-there-be-another-us-government-shutdown-by-december-31",
+    "KXBTC2026200-27JAN01": "will-bitcoin-reach-200000-by-december-31-2026-752",
+    "KXHIGHINFLATION-26DEC": "will-inflation-reach-more-than-3-in-2026",
 }
 
 

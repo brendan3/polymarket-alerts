@@ -43,5 +43,41 @@
     "poly_no_token_id": "43946269812975261940442841140057396362355013850035195910637438338242851933505",
     "poly_end_date_iso": "2026-02-14",
     "equivalence_grade": "A"
+  },
+  {
+    "name": "US recession by end of 2026",
+    "kalshi_ticker": "KXRECSSNBER-26",
+    "kalshi_close_time_iso": "2026-12-31T23:59:59Z",
+    "poly_yes_token_id": "100379208559626151022751801118534484742123694725746262280150222742563282755057",
+    "poly_no_token_id": "113732820231608904682346496304917888352004831436510840986547065248348999143469",
+    "poly_end_date_iso": "2026-12-31",
+    "equivalence_grade": "B"
+  },
+  {
+    "name": "US government shutdown by Dec 31, 2026",
+    "kalshi_ticker": "KXSHUTDOWNBY-26DEC31",
+    "kalshi_close_time_iso": "2026-12-31T23:59:59Z",
+    "poly_yes_token_id": "73336468735525980324238502624150264233952967666570137621106523898691702620425",
+    "poly_no_token_id": "75215266828654246184705553871421878101956718632452622503727035091756338648583",
+    "poly_end_date_iso": "2026-12-31",
+    "equivalence_grade": "A"
+  },
+  {
+    "name": "Bitcoin hits $200k by Dec 31, 2026",
+    "kalshi_ticker": "KXBTC2026200-27JAN01",
+    "kalshi_close_time_iso": "2027-01-01T23:59:59Z",
+    "poly_yes_token_id": "61368943128255287414565270336856615453000675377332178800733742873558311943412",
+    "poly_no_token_id": "96993471854400156408670527613150944443359272190785251193551242374636006072800",
+    "poly_end_date_iso": "2026-12-31",
+    "equivalence_grade": "B"
+  },
+  {
+    "name": "Inflation above 3% in 2026",
+    "kalshi_ticker": "KXHIGHINFLATION-26DEC",
+    "kalshi_close_time_iso": "2026-12-31T23:59:59Z",
+    "poly_yes_token_id": "6478474356831359523032969262014082686922886129187075898439624325202312555669",
+    "poly_no_token_id": "36378311265709846060859255962129667010780913173065483696749977329500251096213",
+    "poly_end_date_iso": "2026-12-31",
+    "equivalence_grade": "A"
   }
 ]
