@@ -1347,6 +1347,16 @@ def main() -> None:
     ap.add_argument("--pages", type=int, default=30, help="Gamma pages to fetch")
     ap.add_argument("--per-page", type=int, default=100)
     ap.add_argument("--telegram", action="store_true", help="Send alerts via Telegram")
+    # Backwards-compat flags so existing Railway/Nixpacks start commands keep working.
+    # These are effectively no-ops in v2 but we accept them to avoid crashes.
+    ap.add_argument("--gamma-active", action="store_true", help="(deprecated, ignored) kept for v1 CLI compatibility")
+    ap.add_argument("--broad-test", action="store_true", help="(deprecated, ignored) kept for v1 CLI compatibility")
+    ap.add_argument(
+        "--whale-threshold",
+        type=float,
+        default=0.0,
+        help="(deprecated, ignored) v2 uses per-strategy sizing instead of this threshold",
+    )
     ap.add_argument("--min-arb-edge", type=float, default=1.5, help="Min cross-platform arb edge (cents)")
     ap.add_argument("--imbalance-threshold", type=float, default=3.0, help="Min bid/ask depth ratio for imbalance signal")
     ap.add_argument("--vwap-deviation", type=float, default=8.0, help="Min VWAP deviation percent")
