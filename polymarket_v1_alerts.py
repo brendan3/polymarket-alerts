@@ -1,199 +1,84 @@
 #!/usr/bin/env python3
 """
-Polymarket alert worker (single WS) with:
-- Price move alerts (price_change events)
-- Whale trade alerts (trade events)
-- Telegram/email notifications
-- SQLite logging
+Polymarket Alpha Engine v2 — Quantified Edge Alert System
 
-Key points:
-✅ Uses ONLY /ws/market (price_change + trade events in same socket)
-✅ Fetches markets from Gamma with server-side filters: active=true, closed=false
-✅ Filters "live" markets client-side by endDate (must NOT be in the past) + clobTokenIds present
-✅ DOES NOT use Gamma's `ready` / `funded` as hard filters (they appear unreliable)
-✅ broad-test mode subscribes to as many assets as possible (up to max_assets)
+Replaces the old reactive notification system with an actual alpha generator.
+Every alert includes: entry price, target, stop, edge in cents, confidence score.
+
+STRATEGIES (ranked by expected alpha):
+1. CROSS-PLATFORM ARB   — Auto-discover Kalshi↔Polymarket pairs, monitor for locked-payout arb
+2. BOOK IMBALANCE        — Track bid/ask depth ratio, signal when imbalance + momentum confirm
+3. VWAP REVERSION/MOM    — Fade low-volume price deviations, follow high-volume deviations
+4. TOXIC FLOW (VPIN)     — Detect informed order flow via volume-bucketed imbalance
+5. LIQ VACUUM            — Detect book depletion after aggressive fills
+
+REQUIRED ENV:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+OPTIONAL ENV (for cross-platform arb — highly recommended):
+  KALSHI_API_KEY, KALSHI_PRIVATE_KEY_PEM (or KALSHI_PRIVATE_KEY_PATH)
+  KALSHI_BASE_URL (default: https://api.elections.kalshi.com/trade-api/v2)
+
+Usage:
+  python polymarket_v1_alerts.py --telegram --pages 30
+  python polymarket_v1_alerts.py --telegram --min-arb-edge 1.0 --imbalance-threshold 2.5
 """
-
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import math
 import os
-import smtplib
 import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import requests
 from websocket import WebSocketApp
 
-# =========================
+# Best-effort fuzzy matching: rapidfuzz > difflib fallback
+try:
+    from rapidfuzz import fuzz as _rfuzz
+
+    def fuzzy_ratio(a: str, b: str) -> float:
+        return _rfuzz.token_sort_ratio(a, b)
+except ImportError:
+    from difflib import SequenceMatcher
+
+    def fuzzy_ratio(a: str, b: str) -> float:  # type: ignore[misc]
+        return SequenceMatcher(None, a.lower().split(), b.lower().split()).ratio() * 100
+
+
+# ═══════════════════════════════════════════
 # Constants
-# =========================
+# ═══════════════════════════════════════════
 
 CLOB_WS_BASE = "wss://ws-subscriptions-clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+POLY_CLOB_BASE = "https://clob.polymarket.com"
+KALSHI_BASE_DEFAULT = "https://api.elections.kalshi.com/trade-api/v2"
 
 
-# =========================
-# Utilities
-# =========================
+# ═══════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def fmt_ts(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
 
 def safe_float(x: Any) -> Optional[float]:
     try:
-        if x is None:
-            return None
-        return float(x)
+        return float(x) if x is not None else None
     except Exception:
         return None
 
-def compute_odds(bid: Any, ask: Any) -> Optional[float]:
-    """Compute mid-price odds from bid/ask or return whichever is available."""
-    b = safe_float(bid)
-    a = safe_float(ask)
-    if b is not None and a is not None and 0 < b < 1 and 0 < a < 1:
-        return (b + a) / 2
-    return b if b is not None else a
-
-def normalize_token_id(s: str) -> str:
-    return (s or "").strip().lower()
-
-def env_truthy(val: Optional[str]) -> bool:
-    if val is None:
-        return False
-    return val.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-def to_bool(value: Any) -> bool:
-    """
-    Robust boolean parser that handles:
-    - bool: True/False
-    - str: "true"/"false", "1"/"0", "yes"/"no" (case-insensitive)
-    - int/float: 1/0
-    - None: False
-    """
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value != 0)
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in {"true", "1", "yes", "y", "on"}:
-            return True
-        if s in {"false", "0", "no", "n", "off", ""}:
-            return False
-    return False
-
-def coerce_json_list(raw: Any) -> List[str]:
-    """
-    Gamma often returns list fields as JSON strings, e.g. outcomes: '["Yes","No"]'
-    This normalizes to a python list[str].
-    """
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return [str(x) for x in raw]
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return []
-        # JSON list in a string
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [str(x) for x in parsed]
-            except Exception:
-                return []
-        # fallback single string
-        return [s]
-    return [str(raw)]
-
-def coerce_clob_token_ids(raw: Any) -> List[str]:
-    """
-    Gamma sometimes returns clobTokenIds as:
-      - list[str]
-      - JSON-encoded string like '["id1","id2"]'
-      - comma-separated string like 'id1,id2'
-    Normalize to List[str].
-    """
-    if raw is None:
-        return []
-
-    if isinstance(raw, (list, tuple)):
-        return [normalize_token_id(str(x)) for x in raw if str(x).strip()]
-
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return []
-
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [normalize_token_id(str(x)) for x in parsed if str(x).strip()]
-            except Exception:
-                pass
-
-        if "," in s:
-            parts = [p.strip() for p in s.split(",")]
-            return [normalize_token_id(p.strip('"').strip("'")) for p in parts if p.strip('"').strip("'")]
-
-        return [normalize_token_id(s.strip('"').strip("'"))]
-
-    return [normalize_token_id(str(raw))] if str(raw).strip() else []
-
-def parse_end_date(value: Any, now_ts: float) -> Optional[float]:
-    """
-    Parse endDate and return unix timestamp if date is IN THE PAST.
-    Returns None if:
-      - missing
-      - parse fails
-      - date is in the future
-    """
-    if value is None:
-        return None
-
-    if isinstance(value, (int, float)):
-        ts = float(value)
-        if 946684800 <= ts <= 4102444800:
-            return ts if ts < now_ts else None
-
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return None
-        try:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            elif "T" in s and "+" not in s and s.count("-") >= 2:
-                s = s + "+00:00"
-            dt = datetime.fromisoformat(s)
-            ts = dt.timestamp()
-            return ts if ts < now_ts else None
-        except Exception:
-            try:
-                ts = float(s)
-                if 946684800 <= ts <= 4102444800:
-                    return ts if ts < now_ts else None
-            except Exception:
-                return None
-
-    return None
 
 def as_money(x: Optional[float]) -> str:
     if x is None:
@@ -204,891 +89,1317 @@ def as_money(x: Optional[float]) -> str:
         return f"${x / 1_000:.1f}K"
     return f"${x:.0f}"
 
-def fmt_spread(spread: Optional[float]) -> str:
-    return f"{spread:.4f}" if spread is not None else "n/a"
 
-
-# =========================
-# Email & Telegram
-# =========================
-
-def _get_email_config() -> dict:
-    host = os.getenv("ALERT_SMTP_HOST") or os.getenv("SMTP_HOST")
-    port = int(os.getenv("ALERT_SMTP_PORT") or os.getenv("SMTP_PORT") or "587")
-    user = os.getenv("ALERT_SMTP_USER") or os.getenv("SMTP_USER")
-    pw   = os.getenv("ALERT_SMTP_PASS") or os.getenv("SMTP_PASS")
-
-    email_from = os.getenv("ALERT_EMAIL_FROM") or os.getenv("EMAIL_FROM")
-    email_to   = os.getenv("ALERT_EMAIL_TO") or os.getenv("EMAIL_TO")
-
-    enabled = env_truthy(os.getenv("EMAIL_ENABLED")) or env_truthy(os.getenv("ALERT_EMAIL_ENABLED"))
-    if os.getenv("EMAIL_ENABLED") is None and os.getenv("ALERT_EMAIL_ENABLED") is None:
-        enabled = True
-
-    return {
-        "enabled": enabled,
-        "host": host,
-        "port": port,
-        "user": user,
-        "pw": pw,
-        "from": email_from,
-        "to": email_to,
-    }
-
-def send_email(subject: str, body: str) -> None:
-    cfg = _get_email_config()
-    if not cfg["enabled"]:
-        return
-    if not all([cfg["host"], cfg["user"], cfg["pw"], cfg["from"], cfg["to"]]):
-        return
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"]    = cfg["from"]
-    msg["To"]      = cfg["to"]
-
-    try:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as s:
-            if env_truthy(os.getenv("SMTP_STARTTLS")) or os.getenv("SMTP_STARTTLS") is None:
-                s.starttls()
-            s.login(cfg["user"], cfg["pw"])
-            s.sendmail(cfg["from"], [cfg["to"]], msg.as_string())
-    except Exception as e:
-        print(f"[email] send_email exception: {e}")
-
-def send_telegram_message(body: str) -> None:
+def send_telegram(body: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    enabled_env = env_truthy(os.getenv("TELEGRAM_ENABLED")) or env_truthy(os.getenv("ALERT_TELEGRAM_ENABLED"))
-    enabled = enabled_env or (token and chat_id)
-    if not enabled or not token or not chat_id:
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        print(f"[ALERT] {body}")
         return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": body}
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        # Log success occasionally (not every message to avoid spam)
-        if hasattr(send_telegram_message, "_msg_count"):
-            send_telegram_message._msg_count += 1
-        else:
-            send_telegram_message._msg_count = 1
-        
-        if send_telegram_message._msg_count == 1 or send_telegram_message._msg_count % 50 == 0:
-            print(f"[telegram] Message sent successfully (total sent: {send_telegram_message._msg_count})")
-    except requests.exceptions.HTTPError as e:
-        print(f"[telegram] HTTP error sending message: {e} (status: {e.response.status_code if hasattr(e, 'response') else 'unknown'})")
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_body = e.response.json()
-                print(f"[telegram] Error response: {error_body}")
-            except Exception:
-                print(f"[telegram] Error response body: {e.response.text[:200]}")
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": body, "disable_web_page_preview": True},
+            timeout=10,
+        )
     except Exception as e:
-        print(f"[telegram] Exception sending message: {e}")
+        print(f"[telegram error] {e}")
 
 
-# =========================
-# Gamma Metadata
-# =========================
+def coerce_json_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("["):
+            try:
+                return [str(x) for x in json.loads(s)]
+            except Exception:
+                return []
+        return [s] if s else []
+    return [str(raw)]
+
+
+# ═══════════════════════════════════════════
+# Data Models
+# ═══════════════════════════════════════════
 
 @dataclass
-class MarketMeta:
-    market_question: str
-    event_title: str
+class PolyMarket:
+    condition_id: str
+    question: str
     event_slug: Optional[str]
-    volume: Optional[float]
-    liquidity: Optional[float]
     outcomes: List[str]
     clob_token_ids: List[str]
+    volume: Optional[float] = None
+    liquidity: Optional[float] = None
 
-    def title(self) -> str:
-        if self.event_title and self.event_title != self.market_question:
-            return f"{self.event_title} — {self.market_question}"
-        return self.market_question
+    def url(self) -> str:
+        return f"https://polymarket.com/event/{self.event_slug}" if self.event_slug else ""
 
+    def outcome_for_token(self, tid: str) -> str:
+        try:
+            idx = self.clob_token_ids.index(tid)
+            return self.outcomes[idx] if idx < len(self.outcomes) else "?"
+        except ValueError:
+            return "?"
 
-def fetch_gamma_markets(per_page: int, pages: int, *, active_only: bool = True, broad_test: bool = False) -> Tuple[List[MarketMeta], int]:
-    """
-    Fetch markets from Gamma API using server-side filters:
-      - active=true (optional)
-      - closed=false (always)
-
-    Client-side filters:
-      - endDate must NOT be in the past
-      - must have clobTokenIds
-      - optionally skip archived/restricted markets
-
-    NOTE: We intentionally do NOT hard-filter on `ready` or `funded` because they appear unreliable.
-    """
-    now_ts = time.time()
-
-    metas: List[MarketMeta] = []
-    raw_markets_count = 0
-
-    filtered_closed = 0
-    filtered_archived = 0
-    # NOTE: We no longer filter on `restricted`, but we keep this counter for
-    # backwards-compatible logging (it will always remain 0).
-    filtered_restricted = 0
-    filtered_enddate = 0
-    filtered_missing_tokens = 0
-
-    samples_logged = 0
-
-    print(f"[market_fetch] Fetching {pages} pages ({per_page} per page) with closed=false filter...")
-
-    for p in range(pages):
-        params = {"limit": per_page, "offset": p * per_page, "closed": "false"}
-        if active_only:
-            params["active"] = "true"
-
-        url = f"{GAMMA_BASE}/markets"
-        if p == 0:
-            qs = "&".join([f"{k}={v}" for k, v in params.items()])
-            print(f"[market_fetch] Full URL: {url}?{qs}")
-
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        markets = r.json()
-
-        raw_markets_count += len(markets)
-
-        # Page stats: how many came back closed anyway (sanity)
-        if p == 0 and markets:
-            c_false = sum(1 for m in markets if not to_bool(m.get("closed")))
-            c_true = sum(1 for m in markets if to_bool(m.get("closed")))
-            print(f"[market_fetch] Page 0: closed=false={c_false} closed=true={c_true} total={len(markets)}")
-
-        for m in markets:
-            if samples_logged < 3:
-                print(
-                    f"[market_sample] market[{samples_logged}] id={m.get('id') or m.get('slug')} "
-                    f"closed={m.get('closed')!r} archived={m.get('archived')!r} "
-                    f"restricted={m.get('restricted')!r} active={m.get('active')!r} "
-                    f"ready={m.get('ready')!r} funded={m.get('funded')!r} "
-                    f"endDate={m.get('endDate')!r} updatedAt={m.get('updatedAt')!r}"
-                )
-                samples_logged += 1
-
-            # Safety: if API ever returns closed=true despite closed=false param
-            if to_bool(m.get("closed")):
-                filtered_closed += 1
-                continue
-
-            # Skip archived (archived markets are not tradable / visible)
-            # NOTE: We intentionally **do not** skip restricted markets here.
-            # Restricted == True may just mean certain users can't trade,
-            # but orderflow and prices are still visible and useful for alerts.
-            if to_bool(m.get("archived")):
-                filtered_archived += 1
-                continue
-
-            # Skip markets whose endDate is in the past
-            end_date_ts = parse_end_date(m.get("endDate"), now_ts)
-            if end_date_ts is not None:
-                filtered_enddate += 1
-                continue
-
-            raw_clob = m.get("clobTokenIds")
-            clob_ids = coerce_clob_token_ids(raw_clob)
-            if not clob_ids:
-                filtered_missing_tokens += 1
-                continue
-
-            outcomes = coerce_json_list(m.get("outcomes"))
-            metas.append(
-                MarketMeta(
-                    market_question=m.get("question") or "Unknown",
-                    event_title=(m.get("title") or ""),
-                    event_slug=m.get("eventSlug"),
-                    volume=safe_float(m.get("volume") or m.get("volumeNum")),
-                    liquidity=safe_float(m.get("liquidity") or m.get("liquidityNum")),
-                    outcomes=outcomes,
-                    clob_token_ids=clob_ids,
-                )
-            )
-
-    print(
-        f"[market_filter] raw_markets={raw_markets_count} "
-        f"filtered_closed={filtered_closed} filtered_archived={filtered_archived} "
-        f"filtered_restricted={filtered_restricted} filtered_enddate={filtered_enddate} "
-        f"filtered_missing_tokens={filtered_missing_tokens} remaining={len(metas)}"
-    )
-
-    # Defensive check for suspicious token IDs
-    bad = [m for m in metas if any(len(tid) <= 2 for tid in m.clob_token_ids)]
-    print(f"[sanity] markets_with_suspicious_token_ids={len(bad)}")
-
-    return metas, raw_markets_count
-
-
-# =========================
-# SQLite Logger
-# =========================
-
-class AlertLoggerSQLite:
-    def __init__(self, path: str):
-        self.path = path
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(path) as c:
-            c.execute(
-                """
-                CREATE TABLE IF NOT EXISTS alerts (
-                  id INTEGER PRIMARY KEY,
-                  ts_ms INTEGER,
-                  ts_iso TEXT,
-                  market_title TEXT,
-                  event_title TEXT,
-                  outcome TEXT,
-                  from_odds REAL,
-                  to_odds REAL,
-                  move_pct REAL,
-                  volume REAL,
-                  liquidity REAL,
-                  best_bid REAL,
-                  best_ask REAL,
-                  spread REAL,
-                  asset_id TEXT,
-                  ws_market_id TEXT,
-                  alert_type TEXT,
-                  notional REAL,
-                  decision TEXT,
-                  notes TEXT,
-                  result TEXT,
-                  pnl REAL
-                )
-                """
-            )
-            c.commit()
-
-    def log(self, row: dict) -> None:
-        with sqlite3.connect(self.path) as c:
-            cols = ",".join(row.keys())
-            qs   = ",".join("?" * len(row))
-            c.execute(f"INSERT INTO alerts ({cols}) VALUES ({qs})", list(row.values()))
-            c.commit()
-
-
-# =========================
-# Core Watcher (single WS)
-# =========================
 
 @dataclass
-class PricePoint:
-    ts: int
-    odds: float
+class KalshiMarket:
+    ticker: str
+    title: str
+    event_ticker: str
+    close_time: Optional[str] = None
+    yes_bid: float = 0.0
+    yes_ask: float = 1.0
+    volume: float = 0.0
+    open_interest: float = 0.0
 
-class MarketWatcher:
+
+@dataclass
+class DiscoveredPair:
+    name: str
+    poly_market: PolyMarket
+    kalshi_market: KalshiMarket
+    match_score: float
+    grade: str  # A / B / C
+    poly_yes_token: str
+    poly_no_token: str
+
+
+@dataclass
+class TradeRecord:
+    ts: float
+    price: float
+    size: float
+    direction: str  # BUY / SELL
+    notional: float
+
+
+# ─── Unified alert format: every signal is actionable ───
+
+@dataclass
+class AlertSignal:
+    strategy: str
+    market_name: str
+    edge_cents: float          # quantified edge in cents per $1
+    confidence: int            # 0-100
+    entry_price: float
+    entry_side: str            # "BUY YES", "SELL YES", etc.
+    target_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    depth_available: Optional[float] = None
+    time_horizon: str = ""
+    url: str = ""
+    details: str = ""
+
+    def score(self) -> float:
+        """Composite alpha score for prioritization."""
+        depth = max(self.depth_available or 100, 100)
+        return self.edge_cents * (self.confidence / 100.0) * math.log10(depth)
+
+    def format(self) -> str:
+        lines = [
+            f"🎯 [{self.strategy}] {self.market_name}",
+            f"Edge: {self.edge_cents:.1f}¢/$1 | Confidence: {self.confidence}/100 | Score: {self.score():.1f}",
+            f"Entry: {self.entry_side} @ {self.entry_price:.3f}",
+        ]
+        if self.target_price is not None:
+            t = f"Target: {self.target_price:.3f}"
+            if self.stop_price is not None:
+                t += f" | Stop: {self.stop_price:.3f}"
+            lines.append(t)
+        if self.depth_available:
+            lines.append(f"Depth: {as_money(self.depth_available)}")
+        if self.time_horizon:
+            lines.append(f"Horizon: {self.time_horizon}")
+        if self.details:
+            lines.append(self.details)
+        if self.url:
+            lines.append(self.url)
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════
+# SQLite Alert Logger
+# ═══════════════════════════════════════════
+
+class AlertLogger:
+    def __init__(self, path: str = "data/alpha_engine.db"):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        with sqlite3.connect(path) as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    strategy TEXT,
+                    market TEXT,
+                    edge_cents REAL,
+                    confidence INTEGER,
+                    entry_price REAL,
+                    entry_side TEXT,
+                    target_price REAL,
+                    stop_price REAL,
+                    depth_usd REAL,
+                    score REAL,
+                    details TEXT
+                )
+            """)
+            c.commit()
+
+    def log(self, signal: AlertSignal) -> None:
+        try:
+            with sqlite3.connect(self.path) as c:
+                c.execute(
+                    "INSERT INTO signals "
+                    "(ts,strategy,market,edge_cents,confidence,entry_price,entry_side,"
+                    "target_price,stop_price,depth_usd,score,details) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        now_utc_iso(), signal.strategy, signal.market_name,
+                        signal.edge_cents, signal.confidence, signal.entry_price,
+                        signal.entry_side, signal.target_price, signal.stop_price,
+                        signal.depth_available, signal.score(), signal.details,
+                    ),
+                )
+                c.commit()
+        except Exception as e:
+            print(f"[db error] {e}")
+
+
+# ═══════════════════════════════════════════
+# Kalshi API Client
+# ═══════════════════════════════════════════
+
+def _sign_kalshi(pem: str, ts_ms: str, method: str, path: str) -> str:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+
+    key = serialization.load_pem_private_key(
+        pem.encode() if isinstance(pem, str) else pem, password=None,
+    )
+    msg = (ts_ms + method + path.split("?")[0]).encode()
+    sig = key.sign(
+        msg,
+        asym_padding.PSS(mgf=asym_padding.MGF1(hashes.SHA256()), salt_length=asym_padding.PSS.MAX_LENGTH),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(sig).decode()
+
+
+class KalshiClient:
+    """Minimal Kalshi v2 REST client for market discovery + orderbook polling."""
+
+    def __init__(self, base_url: str, api_key: Optional[str], private_key_pem: Optional[str]):
+        self.base = base_url.rstrip("/")
+        self.api_key = api_key
+        self.pem = private_key_pem
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key and self.pem)
+
+    def _headers(self, method: str, path: str) -> Dict[str, str]:
+        if not self.enabled:
+            return {}
+        try:
+            ts = str(int(time.time() * 1000))
+            sig = _sign_kalshi(self.pem, ts, method, path)  # type: ignore[arg-type]
+            return {
+                "KALSHI-ACCESS-KEY": self.api_key,  # type: ignore[dict-item]
+                "KALSHI-ACCESS-TIMESTAMP": ts,
+                "KALSHI-ACCESS-SIGNATURE": sig,
+            }
+        except Exception:
+            return {}
+
+    # ── market discovery ──
+
+    def fetch_markets(self, limit: int = 200, status: str = "open") -> List[KalshiMarket]:
+        markets: List[KalshiMarket] = []
+        cursor: Optional[str] = None
+
+        for _ in range(20):
+            path = "/trade-api/v2/markets"
+            params: Dict[str, Any] = {"limit": limit, "status": status}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                r = requests.get(
+                    f"{self.base}/markets", params=params,
+                    headers=self._headers("GET", path), timeout=20,
+                )
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                print(f"[kalshi] fetch error: {e}")
+                break
+
+            for m in data.get("markets", []):
+                yes_bid_raw = safe_float(m.get("yes_bid"))
+                yes_ask_raw = safe_float(m.get("yes_ask"))
+                # Kalshi may return prices in cents (int) — normalise to 0-1
+                yes_bid = (yes_bid_raw / 100.0 if yes_bid_raw and yes_bid_raw > 1.0 else yes_bid_raw) or 0.0
+                yes_ask = (yes_ask_raw / 100.0 if yes_ask_raw and yes_ask_raw > 1.0 else yes_ask_raw) or 1.0
+
+                markets.append(KalshiMarket(
+                    ticker=m.get("ticker", ""),
+                    title=m.get("title", ""),
+                    event_ticker=m.get("event_ticker", ""),
+                    close_time=m.get("close_time"),
+                    yes_bid=yes_bid,
+                    yes_ask=yes_ask,
+                    volume=safe_float(m.get("volume")) or 0.0,
+                    open_interest=safe_float(m.get("open_interest")) or 0.0,
+                ))
+
+            cursor = data.get("cursor")
+            if not cursor or not data.get("markets"):
+                break
+            time.sleep(0.1)
+
+        return markets
+
+    # ── orderbook ──
+
+    def fetch_orderbook(self, ticker: str, depth: int = 50) -> Dict[str, Any]:
+        path = f"/trade-api/v2/markets/{ticker}/orderbook"
+        try:
+            r = requests.get(
+                f"{self.base}/markets/{ticker}/orderbook",
+                params={"depth": depth},
+                headers=self._headers("GET", path), timeout=15,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return {}
+
+    def parse_orderbook_bba(
+        self, ob: Dict[str, Any],
+    ) -> Tuple[float, float, float, float]:
+        """Return (yes_bid, yes_ask, bid_depth_$, ask_depth_$)."""
+        orderbook = ob.get("orderbook") or {}
+
+        def _parse(levels: Any) -> List[Tuple[float, float]]:
+            out: List[Tuple[float, float]] = []
+            for lvl in (levels or []):
+                if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                    p = float(lvl[0])
+                    if p > 1.0:
+                        p /= 100.0
+                    out.append((p, float(lvl[1])))
+            return out
+
+        yes = _parse(orderbook.get("yes"))
+        no = _parse(orderbook.get("no"))
+        if not yes or not no:
+            return (0.0, 1.0, 0.0, 0.0)
+
+        best_yes_bid = max(yes, key=lambda t: t[0])
+        best_no_bid = max(no, key=lambda t: t[0])
+        return (
+            best_yes_bid[0],
+            1.0 - best_no_bid[0],
+            sum(p * q for p, q in yes),
+            sum((1.0 - p) * q for p, q in no),
+        )
+
+
+# ═══════════════════════════════════════════
+# Gamma Market Fetcher (Polymarket)
+# ═══════════════════════════════════════════
+
+def fetch_polymarket_markets(per_page: int = 100, pages: int = 30) -> Dict[str, PolyMarket]:
+    """Return {token_id: PolyMarket} for all active markets."""
+    markets: Dict[str, PolyMarket] = {}
+    for p in range(pages):
+        try:
+            r = requests.get(
+                f"{GAMMA_BASE}/markets",
+                params={"limit": per_page, "offset": p * per_page, "closed": "false", "active": "true"},
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json()
+            items = data if isinstance(data, list) else data.get("markets", [])
+        except Exception as e:
+            print(f"[gamma] page {p} error: {e}")
+            continue
+        if not items:
+            break
+        for m in items:
+            clob_ids = coerce_json_list(m.get("clobTokenIds") or m.get("clob_token_ids"))
+            if not clob_ids:
+                continue
+            outcomes = coerce_json_list(m.get("outcomes"))
+            mkt = PolyMarket(
+                condition_id=m.get("conditionId") or "",
+                question=m.get("question") or "?",
+                event_slug=m.get("eventSlug") or m.get("slug"),
+                outcomes=outcomes,
+                clob_token_ids=clob_ids,
+                volume=safe_float(m.get("volume")),
+                liquidity=safe_float(m.get("liquidity")),
+            )
+            for tid in clob_ids:
+                markets[tid] = mkt
+        time.sleep(0.15)
+    return markets
+
+
+# ═══════════════════════════════════════════
+# STRATEGY 1 — Cross-Platform Auto-Arbitrage
+# ═══════════════════════════════════════════
+
+class CrossPlatformArbitrage:
     """
-    Single websocket subscriber for /ws/market that handles:
-      - price_change -> price move alerts
-      - trade        -> whale alerts
+    Auto-discover equivalent markets between Kalshi and Polymarket via
+    fuzzy name matching, then poll both orderbooks for locked-payout arb.
+
+    Edge = $1.00 − (ask_A + ask_B) − fees.
+    This is GUARANTEED PROFIT when edge > 0.
     """
 
     def __init__(
         self,
-        metas: List[MarketMeta],
-        *,
-        window_min: int,
-        move_pct: float,
-        min_volume: float,
-        min_liquidity: float,
-        max_spread: float,
-        max_assets: int,
-        whale_threshold: float,
-        whale_cooldown_sec: int,
-        email: bool,
-        telegram: bool,
-        logger: AlertLoggerSQLite,
-        heartbeat_sec: int,
-        broad_test: bool = False,
+        kalshi: KalshiClient,
+        poly_markets: Dict[str, PolyMarket],
+        min_edge_cents: float = 1.5,
+        min_match_score: float = 75.0,
+        kalshi_fee_bps: float = 0.0,
+        poly_fee_bps: float = 0.0,
     ):
-        self.metas = metas
-        self.asset_to_meta: Dict[str, MarketMeta] = {tid: m for m in metas for tid in m.clob_token_ids}
+        self.kalshi = kalshi
+        self.poly_markets = poly_markets
+        self.min_edge = min_edge_cents
+        self.min_match = min_match_score
+        self.k_fee = kalshi_fee_bps
+        self.p_fee = poly_fee_bps
 
-        self.window_ms = window_min * 60 * 1000
-        self.move_threshold = move_pct / 100.0
-        self.min_volume = min_volume
-        self.min_liquidity = min_liquidity
-        self.max_spread = max_spread
+        self.pairs: List[DiscoveredPair] = []
+        self._last_alert: Dict[str, float] = {}
+        self._cooldown = 300.0
 
-        self.max_assets = max_assets
-        self.whale_threshold = whale_threshold
-        self.whale_cooldown_sec = whale_cooldown_sec
+        # Deduplicated question → PolyMarket lookup
+        self._poly_by_q: Dict[str, PolyMarket] = {}
+        seen: Set[str] = set()
+        for mkt in poly_markets.values():
+            if mkt.question not in seen:
+                self._poly_by_q[mkt.question] = mkt
+                seen.add(mkt.question)
 
-        self.email = email
-        self.telegram = telegram
-        self.logger = logger
+    # ── discovery ──
 
-        self.price_history: Dict[str, Deque[PricePoint]] = defaultdict(deque)
-        self.last_price_alert_ms: Dict[str, int] = {}
-        self.last_whale_alert_s: Dict[str, float] = {}
-        # Track seen transaction hashes to avoid duplicate alerts on reconnects/replays
-        self._seen_tx_hashes: set = set()
-        # Limit size to prevent memory growth (keep last 10k hashes)
-        self._max_seen_tx_hashes = 10000
+    def discover_pairs(self) -> List[DiscoveredPair]:
+        print("[arb] Fetching Kalshi markets for auto-discovery...")
+        kalshi_mkts = self.kalshi.fetch_markets()
+        print(f"[arb] {len(kalshi_mkts)} Kalshi markets vs {len(self._poly_by_q)} Poly questions")
 
-        self.heartbeat_sec = heartbeat_sec
-        self._last_heartbeat = time.time()
-        self._last_msg_ts = time.time()
-        self._last_pong_ts = time.time()
-        self._idle_timeout_sec = 180
-        self._ws_connected = False
-        self._ws_instance = None
+        poly_qs = list(self._poly_by_q.keys())
+        pairs: List[DiscoveredPair] = []
 
-        self._msg_count = 0
-        self._msg_timestamps: Deque[float] = deque(maxlen=60)
-        self._last_message_type = "none"
-        self._debug_seen_event_types: Dict[str, int] = defaultdict(int)
-        self._book_event_count = 0  # Track book events for summary logging
-        # Debug sampling controls (can be overridden via env)
-        # - POLY_DEBUG_SAMPLE_EVERY: log 1 full payload for unknown event types every N messages
-        # - POLY_DEBUG_LAST_TRADE_SAMPLE_EVERY: log 1 full payload for last_trade_price every N messages
-        self._debug_sample_every = int(os.getenv("POLY_DEBUG_SAMPLE_EVERY") or "500")
-        self._debug_last_trade_sample_every = int(os.getenv("POLY_DEBUG_LAST_TRADE_SAMPLE_EVERY") or "50")
-
-        self.asset_ids = self._select_asset_ids(broad_test=broad_test)
-
-    def _select_asset_ids(self, broad_test: bool = False) -> List[str]:
-        """
-        In broad_test mode:
-          - subscribe to as many assets as possible (up to max_assets), sorted by liquidity/volume desc
-          - thresholds can be 0 so we don't exclude low-liquidity markets during testing
-        """
-        total_markets = len(self.metas)
-        candidates: List[Tuple[float, float, str, MarketMeta]] = []
-
-        filtered_volume = 0
-        filtered_liquidity = 0
-        passed_markets = 0
-
-        for m in self.metas:
-            vol = m.volume or 0.0
-            liq = m.liquidity or 0.0
-
-            if vol < self.min_volume:
-                filtered_volume += 1
+        for km in kalshi_mkts:
+            if km.volume < 50:
                 continue
-            if liq < self.min_liquidity:
-                filtered_liquidity += 1
+            best_score, best_q = 0.0, ""
+            for pq in poly_qs:
+                score = fuzzy_ratio(km.title, pq)
+                if score > best_score:
+                    best_score, best_q = score, pq
+            if best_score < self.min_match or not best_q:
+                continue
+            pm = self._poly_by_q[best_q]
+            if len(pm.clob_token_ids) < 2:
+                continue
+            grade = "A" if best_score >= 90 else ("B" if best_score >= 80 else "C")
+            pairs.append(DiscoveredPair(
+                name=km.title[:80],
+                poly_market=pm, kalshi_market=km,
+                match_score=best_score, grade=grade,
+                poly_yes_token=pm.clob_token_ids[0],
+                poly_no_token=pm.clob_token_ids[1],
+            ))
+
+        self.pairs = pairs
+        print(f"[arb] Discovered {len(pairs)} cross-platform pairs:")
+        for p in pairs[:15]:
+            print(f"  [{p.grade}] {p.match_score:.0f}%  K:{p.kalshi_market.ticker}  ↔  P:{p.poly_market.question[:55]}")
+        return pairs
+
+    # ── real-time check ──
+
+    def check_all_pairs(self) -> List[AlertSignal]:
+        signals: List[AlertSignal] = []
+        now = time.time()
+
+        for pair in self.pairs:
+            if pair.grade not in ("A", "B"):
+                continue
+            key = pair.kalshi_market.ticker
+            if key in self._last_alert and (now - self._last_alert[key]) < self._cooldown:
                 continue
 
-            passed_markets += 1
-            for aid in m.clob_token_ids:
-                candidates.append((liq, vol, aid, m))
+            try:
+                k_ob = self.kalshi.fetch_orderbook(pair.kalshi_market.ticker)
+                ky_bid, ky_ask, k_bid_d, k_ask_d = self.kalshi.parse_orderbook_bba(k_ob)
 
-        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                py_book = requests.get(
+                    f"{POLY_CLOB_BASE}/book", params={"token_id": pair.poly_yes_token}, timeout=10,
+                ).json()
+                pn_book = requests.get(
+                    f"{POLY_CLOB_BASE}/book", params={"token_id": pair.poly_no_token}, timeout=10,
+                ).json()
 
-        print(
-            "[asset_select] markets_total=%d passed=%d filtered_volume=%d filtered_liquidity=%d "
-            "candidates=%d min_volume=%.2f min_liquidity=%.2f max_assets=%d"
-            % (
-                total_markets,
-                passed_markets,
-                filtered_volume,
-                filtered_liquidity,
-                len(candidates),
-                self.min_volume,
-                self.min_liquidity,
-                self.max_assets,
-            )
+                py_asks = py_book.get("asks", [])
+                pn_asks = pn_book.get("asks", [])
+                py_bids = py_book.get("bids", [])
+                pn_bids = pn_book.get("bids", [])
+                if not py_asks or not pn_asks:
+                    continue
+
+                py_ask = min(float(x["price"]) for x in py_asks)
+                pn_ask = min(float(x["price"]) for x in pn_asks)
+                py_bid = max(float(x["price"]) for x in py_bids) if py_bids else 0.0
+                pn_bid = max(float(x["price"]) for x in pn_bids) if pn_bids else 0.0
+            except Exception:
+                continue
+
+            # Direction 1: Buy YES Kalshi + Buy NO Polymarket
+            cost1 = ky_ask + pn_ask + ky_ask * (self.k_fee / 1e4) + pn_ask * (self.p_fee / 1e4)
+            edge1 = (1.0 - cost1) * 100.0
+
+            # Direction 2: Buy YES Polymarket + Buy NO Kalshi
+            k_no_ask = 1.0 - ky_bid if ky_bid > 0 else 1.0
+            cost2 = py_ask + k_no_ask + py_ask * (self.p_fee / 1e4) + k_no_ask * (self.k_fee / 1e4)
+            edge2 = (1.0 - cost2) * 100.0
+
+            for edge, label, entry_px in [
+                (edge1, "Buy YES Kalshi + Buy NO Poly", ky_ask),
+                (edge2, "Buy YES Poly + Buy NO Kalshi", py_ask),
+            ]:
+                if edge >= self.min_edge:
+                    self._last_alert[key] = now
+                    conf = min(98, int(55 + pair.match_score / 2))
+                    if pair.grade == "A":
+                        conf = min(98, conf + 8)
+                    signals.append(AlertSignal(
+                        strategy="CROSS-PLATFORM ARB",
+                        market_name=pair.name,
+                        edge_cents=edge,
+                        confidence=conf,
+                        entry_price=entry_px,
+                        entry_side=label,
+                        target_price=None,
+                        depth_available=min(k_ask_d, k_bid_d) if k_ask_d and k_bid_d else None,
+                        time_horizon=f"Hold to settlement ({pair.kalshi_market.close_time or 'TBD'})",
+                        url=pair.poly_market.url(),
+                        details=(
+                            f"Grade {pair.grade} ({pair.match_score:.0f}%) | Kalshi: {pair.kalshi_market.ticker}\n"
+                            f"K YES {ky_bid:.3f}/{ky_ask:.3f} | P YES {py_bid:.3f}/{py_ask:.3f} | P NO {pn_bid:.3f}/{pn_ask:.3f}"
+                        ),
+                    ))
+                    break  # alert best direction only
+
+        return signals
+
+
+# ═══════════════════════════════════════════
+# STRATEGY 2 — Orderbook Imbalance Momentum
+# ═══════════════════════════════════════════
+
+class OrderbookImbalance:
+    """
+    Heavy bid-side depth + upward momentum → BUY signal (and vice-versa).
+
+    Why this works: prediction markets are thin enough that resting depth
+    reveals informed participant positioning. Momentum confirmation filters
+    out passive/stale liquidity.
+    """
+
+    def __init__(
+        self,
+        markets: Dict[str, PolyMarket],
+        imbalance_threshold: float = 3.0,
+        momentum_window_sec: float = 60.0,
+        min_momentum_bps: float = 50.0,
+        min_total_depth: float = 1000.0,
+        max_levels: int = 10,
+    ):
+        self.markets = markets
+        self.threshold = imbalance_threshold
+        self.mom_window = momentum_window_sec
+        self.min_mom_bps = min_momentum_bps
+        self.min_depth = min_total_depth
+        self.max_levels = max_levels
+
+        self._mid_hist: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._last_alert: Dict[str, float] = {}
+        self._cooldown = 300.0
+
+    def update(
+        self, token_id: str,
+        bids: List[Tuple[float, float]],
+        asks: List[Tuple[float, float]],
+    ) -> Optional[AlertSignal]:
+        if token_id not in self.markets:
+            return None
+        now = time.time()
+        if token_id in self._last_alert and (now - self._last_alert[token_id]) < self._cooldown:
+            return None
+        if not bids or not asks:
+            return None
+
+        best_bid = max(p for p, _ in bids)
+        best_ask = min(p for p, _ in asks)
+        mid = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+
+        if mid < 0.05 or mid > 0.95:
+            return None
+
+        self._mid_hist[token_id].append((now, mid))
+
+        bid_d = sum(p * s for p, s in bids[: self.max_levels] if 0.10 <= p <= 0.90)
+        ask_d = sum(p * s for p, s in asks[: self.max_levels] if 0.10 <= p <= 0.90)
+        total = bid_d + ask_d
+        if total < self.min_depth or bid_d == 0 or ask_d == 0:
+            return None
+
+        ratio = bid_d / ask_d
+        inv = ask_d / bid_d
+
+        if ratio >= self.threshold:
+            side, r = "BUY", ratio
+        elif inv >= self.threshold:
+            side, r = "SELL", inv
+        else:
+            return None
+
+        # Momentum confirmation
+        recent = [(t, m) for t, m in self._mid_hist[token_id] if now - t <= self.mom_window]
+        if len(recent) < 3:
+            return None
+        mom_bps = ((mid - recent[0][1]) / recent[0][1]) * 10_000 if recent[0][1] > 0 else 0
+        if side == "BUY" and mom_bps < self.min_mom_bps:
+            return None
+        if side == "SELL" and mom_bps > -self.min_mom_bps:
+            return None
+
+        self._last_alert[token_id] = now
+        mkt = self.markets[token_id]
+        outcome = mkt.outcome_for_token(token_id)
+
+        est_move = spread * (r - 1) / r
+        edge = max(est_move * 100, 1.0)
+        entry = best_ask if side == "BUY" else best_bid
+        target = entry + est_move if side == "BUY" else entry - est_move
+        stop = entry - spread * 2 if side == "BUY" else entry + spread * 2
+
+        return AlertSignal(
+            strategy="BOOK IMBALANCE",
+            market_name=f"{mkt.question[:60]} ({outcome})",
+            edge_cents=edge,
+            confidence=min(80, int(40 + r * 8)),
+            entry_price=round(entry, 3),
+            entry_side=f"{side} YES",
+            target_price=round(target, 3),
+            stop_price=round(stop, 3),
+            depth_available=bid_d if side == "BUY" else ask_d,
+            time_horizon="5-30 min",
+            url=mkt.url(),
+            details=(
+                f"Bid depth: {as_money(bid_d)} | Ask depth: {as_money(ask_d)} | Ratio: {r:.1f}:1\n"
+                f"Momentum: {mom_bps:.0f}bps/{self.mom_window:.0f}s | Spread: {spread * 100:.1f}¢"
+            ),
         )
 
-        preview_n = min(25, len(candidates))
-        if preview_n:
-            print(f"[asset_select] Top {preview_n} candidates by (liquidity, volume):")
-            for i in range(preview_n):
-                liq, vol, aid, meta = candidates[i]
-                title = meta.title()
-                if len(title) > 120:
-                    title = title[:117] + "..."
-                print(f"  #{i+1:02d} aid={aid} liq={liq:,.0f} vol={vol:,.0f} market='{title}'")
 
-        picked: List[str] = []
-        seen = set()
-        for liq, vol, aid, meta in candidates:
-            if aid in seen:
-                continue
-            seen.add(aid)
-            picked.append(aid)
-            if self.max_assets and len(picked) >= self.max_assets:
-                break
+# ═══════════════════════════════════════════
+# STRATEGY 3 — VWAP Mean Reversion / Momentum
+# ═══════════════════════════════════════════
 
-        if not picked:
-            fallback = list(self.asset_to_meta.keys())
-            picked = fallback[: min(200, len(fallback))]
-            print(f"[asset_select] FALLBACK: subscribing to {len(picked)} assets from asset_to_meta")
+class VWAPDivergence:
+    """
+    Track 30-min VWAP per token.
 
-        log_n = min(25, len(picked))
-        print(f"[asset_select] Selected assets (showing {log_n}/{len(picked)}):")
-        for i in range(log_n):
-            aid = picked[i]
-            meta = self.asset_to_meta.get(aid)
-            liq = meta.liquidity or 0.0 if meta else 0.0
-            vol = meta.volume or 0.0 if meta else 0.0
-            title = meta.title() if meta else "n/a"
-            if len(title) > 120:
-                title = title[:117] + "..."
-            print(f"  #{i+1:02d} aid={aid} liq={liq:,.0f} vol={vol:,.0f} market='{title}'")
+    - Price deviated on LOW volume  → noise, FADE it  (mean reversion)
+    - Price deviated on HIGH volume → signal, FOLLOW it (momentum)
+    """
 
-        print(f"Subscription set: {len(picked)} assets (max_assets={self.max_assets})")
-        return picked
+    def __init__(
+        self,
+        markets: Dict[str, PolyMarket],
+        vwap_window_sec: float = 1800.0,
+        min_deviation_pct: float = 8.0,
+        min_trades: int = 10,
+        low_vol_pctile: float = 0.3,
+    ):
+        self.markets = markets
+        self.window = vwap_window_sec
+        self.min_dev = min_deviation_pct
+        self.min_trades = min_trades
+        self.low_vol = low_vol_pctile
 
-    def _send(self, subject: str, body: str) -> None:
-        print(body)
-        if self.email:
-            send_email(subject, body)
+        self._trades: Dict[str, Deque[TradeRecord]] = defaultdict(lambda: deque(maxlen=2000))
+        self._mid: Dict[str, float] = {}
+        self._last_alert: Dict[str, float] = {}
+        self._cooldown = 600.0
+
+    def add_trade(self, token_id: str, price: float, size: float, direction: str = "BUY") -> None:
+        if token_id in self.markets:
+            self._trades[token_id].append(
+                TradeRecord(ts=time.time(), price=price, size=size, direction=direction, notional=price * size)
+            )
+
+    def update_mid(self, token_id: str, mid: float) -> None:
+        self._mid[token_id] = mid
+
+    def check(self, token_id: str) -> Optional[AlertSignal]:
+        if token_id not in self.markets or token_id not in self._mid:
+            return None
+        now = time.time()
+        if token_id in self._last_alert and (now - self._last_alert[token_id]) < self._cooldown:
+            return None
+
+        recent = [t for t in self._trades[token_id] if now - t.ts <= self.window]
+        if len(recent) < self.min_trades:
+            return None
+
+        total_pv = sum(t.price * t.size for t in recent)
+        total_v = sum(t.size for t in recent)
+        if total_v == 0:
+            return None
+        vwap = total_pv / total_v
+        cur = self._mid[token_id]
+        if vwap <= 0:
+            return None
+
+        dev_pct = ((cur - vwap) / vwap) * 100
+        if abs(dev_pct) < self.min_dev:
+            return None
+
+        # Volume regime classification
+        v5 = sum(t.notional for t in recent if now - t.ts <= 300)
+        avg5 = (total_pv / max(self.window / 300, 1))
+        low_vol = v5 < avg5 * self.low_vol if avg5 > 0 else True
+
+        if low_vol:
+            # FADE the noise
+            side = "SELL YES" if dev_pct > 0 else "BUY YES"
+            target = vwap
+            edge = abs(cur - vwap) * 100
+            conf = min(75, int(40 + abs(dev_pct) * 2))
+            strat = "VWAP REVERSION"
+            horizon = "15-60 min"
+            stop = cur + (cur - vwap) * 0.5
+        else:
+            # FOLLOW the signal
+            side = "BUY YES" if dev_pct > 0 else "SELL YES"
+            target = cur + (cur - vwap) * 0.5
+            edge = abs(cur - vwap) * 0.5 * 100
+            conf = min(70, int(35 + abs(dev_pct) * 1.5))
+            strat = "VWAP MOMENTUM"
+            horizon = "30-120 min"
+            stop = vwap
+
+        self._last_alert[token_id] = now
+        mkt = self.markets[token_id]
+        outcome = mkt.outcome_for_token(token_id)
+
+        return AlertSignal(
+            strategy=strat,
+            market_name=f"{mkt.question[:60]} ({outcome})",
+            edge_cents=max(edge, 0.5),
+            confidence=conf,
+            entry_price=round(cur, 3),
+            entry_side=side,
+            target_price=round(target, 3),
+            stop_price=round(stop, 3),
+            depth_available=v5 if v5 > 0 else None,
+            time_horizon=horizon,
+            url=mkt.url(),
+            details=(
+                f"VWAP: {vwap:.3f} | Price: {cur:.3f} | Dev: {dev_pct:+.1f}%\n"
+                f"Volume: {'LOW → fade' if low_vol else 'HIGH → follow'} | "
+                f"5m vol: {as_money(v5)} vs avg: {as_money(avg5)}"
+            ),
+        )
+
+
+# ═══════════════════════════════════════════
+# STRATEGY 4 — Trade Flow Toxicity (VPIN)
+# ═══════════════════════════════════════════
+
+class FlowToxicity:
+    """
+    VPIN: Volume-synchronised Probability of INformed trading.
+
+    Bucket trades by volume (not time). In each bucket measure buy/sell
+    imbalance. Rolling average of absolute imbalance = VPIN.
+
+    High VPIN + consistent direction = smart money is active → follow them.
+    """
+
+    def __init__(
+        self,
+        markets: Dict[str, PolyMarket],
+        bucket_size_usd: float = 500.0,
+        num_buckets: int = 20,
+        toxicity_threshold: float = 0.65,
+        min_directional_pct: float = 70.0,
+    ):
+        self.markets = markets
+        self.bucket_sz = bucket_size_usd
+        self.n_buckets = num_buckets
+        self.threshold = toxicity_threshold
+        self.min_dir = min_directional_pct / 100.0
+
+        self._buy: Dict[str, float] = defaultdict(float)
+        self._sell: Dict[str, float] = defaultdict(float)
+        self._vol: Dict[str, float] = defaultdict(float)
+        self._imb: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=60))
+        self._dirs: Dict[str, Deque[str]] = defaultdict(lambda: deque(maxlen=60))
+        self._last_alert: Dict[str, float] = {}
+        self._cooldown = 600.0
+        self._quote: Dict[str, Tuple[float, float]] = {}
+
+    def update_quote(self, token_id: str, bid: float, ask: float) -> None:
+        self._quote[token_id] = (bid, ask)
+
+    def add_trade(self, token_id: str, price: float, size: float) -> Optional[AlertSignal]:
+        if token_id not in self.markets:
+            return None
+
+        if token_id in self._quote:
+            bid, ask = self._quote[token_id]
+            direction = "BUY" if price >= (bid + ask) / 2 else "SELL"
+        else:
+            direction = "BUY" if price >= 0.5 else "SELL"
+
+        notional = price * size
+        if direction == "BUY":
+            self._buy[token_id] += notional
+        else:
+            self._sell[token_id] += notional
+        self._vol[token_id] += notional
+
+        if self._vol[token_id] < self.bucket_sz:
+            return None
+
+        # Bucket full — compute imbalance
+        b, s = self._buy[token_id], self._sell[token_id]
+        total = b + s
+        if total > 0:
+            self._imb[token_id].append(abs(b - s) / total)
+            self._dirs[token_id].append("BUY" if b > s else "SELL")
+
+        self._buy[token_id] = 0.0
+        self._sell[token_id] = 0.0
+        self._vol[token_id] = 0.0
+
+        return self._check(token_id)
+
+    def _check(self, token_id: str) -> Optional[AlertSignal]:
+        now = time.time()
+        if token_id in self._last_alert and (now - self._last_alert[token_id]) < self._cooldown:
+            return None
+
+        imbs = list(self._imb[token_id])
+        dirs = list(self._dirs[token_id])
+        if len(imbs) < self.n_buckets:
+            return None
+
+        vpin = sum(imbs[-self.n_buckets :]) / self.n_buckets
+        if vpin < self.threshold:
+            return None
+
+        buy_n = sum(1 for d in dirs[-self.n_buckets :] if d == "BUY")
+        sell_n = self.n_buckets - buy_n
+        dom_dir = "BUY" if buy_n > sell_n else "SELL"
+        dom_pct = max(buy_n, sell_n) / self.n_buckets
+        if dom_pct < self.min_dir:
+            return None
+
+        self._last_alert[token_id] = now
+        mkt = self.markets[token_id]
+        outcome = mkt.outcome_for_token(token_id)
+
+        entry = 0.5
+        if token_id in self._quote:
+            bid, ask = self._quote[token_id]
+            entry = ask if dom_dir == "BUY" else bid
+
+        edge = vpin * 5.0
+        target = entry + edge / 100 if dom_dir == "BUY" else entry - edge / 100
+        stop = entry - 0.03 if dom_dir == "BUY" else entry + 0.03
+
+        return AlertSignal(
+            strategy="TOXIC FLOW",
+            market_name=f"{mkt.question[:60]} ({outcome})",
+            edge_cents=edge,
+            confidence=min(80, int(vpin * 100)),
+            entry_price=round(entry, 3),
+            entry_side=f"{dom_dir} YES",
+            target_price=round(target, 3),
+            stop_price=round(stop, 3),
+            time_horizon="10-60 min",
+            url=mkt.url(),
+            details=(
+                f"VPIN: {vpin:.2f} | Direction: {dom_dir} ({dom_pct * 100:.0f}% of {self.n_buckets} buckets)\n"
+                f"Informed flow detected — smart money aggressively {dom_dir.lower()}ing"
+            ),
+        )
+
+
+# ═══════════════════════════════════════════
+# STRATEGY 5 — Liquidity Vacuum Detection
+# ═══════════════════════════════════════════
+
+class LiquidityVacuum:
+    """
+    Detect when one side of the book empties after aggressive fills.
+    A gap in the book means price MUST move to find the next resting order.
+    """
+
+    def __init__(
+        self,
+        markets: Dict[str, PolyMarket],
+        min_gap_cents: float = 3.0,
+        min_depth_before: float = 2000.0,
+        depth_drop_pct: float = 60.0,
+    ):
+        self.markets = markets
+        self.min_gap = min_gap_cents
+        self.min_prev = min_depth_before
+        self.drop_pct = depth_drop_pct
+
+        self._prev: Dict[str, Tuple[float, float]] = {}
+        self._last_alert: Dict[str, float] = {}
+        self._cooldown = 600.0
+
+    def update(
+        self, token_id: str,
+        bids: List[Tuple[float, float]],
+        asks: List[Tuple[float, float]],
+    ) -> Optional[AlertSignal]:
+        if token_id not in self.markets:
+            return None
+        now = time.time()
+        if token_id in self._last_alert and (now - self._last_alert[token_id]) < self._cooldown:
+            return None
+        if not bids or not asks:
+            return None
+
+        best_bid = max(p for p, _ in bids)
+        best_ask = min(p for p, _ in asks)
+        mid = (best_bid + best_ask) / 2
+        if mid < 0.10 or mid > 0.90:
+            return None
+
+        bid_d = sum(p * s for p, s in bids if 0.10 <= p <= 0.90)
+        ask_d = sum(p * s for p, s in asks if 0.10 <= p <= 0.90)
+
+        # Find largest gap on each side
+        ask_ps = sorted(p for p, _ in asks if 0.10 <= p <= 0.90)
+        bid_ps = sorted((p for p, _ in bids if 0.10 <= p <= 0.90), reverse=True)
+        ask_gap = max((ask_ps[i + 1] - ask_ps[i] for i in range(len(ask_ps) - 1)), default=0)
+        bid_gap = max((bid_ps[i] - bid_ps[i + 1] for i in range(len(bid_ps) - 1)), default=0)
+
+        prev = self._prev.get(token_id)
+        self._prev[token_id] = (bid_d, ask_d)
+        if prev is None:
+            return None
+
+        prev_bid, prev_ask = prev
+        drop = 1.0 - self.drop_pct / 100.0
+
+        signal = None
+        mkt = self.markets[token_id]
+        outcome = mkt.outcome_for_token(token_id)
+
+        # Ask vacuum → price up
+        if prev_ask > self.min_prev and ask_d < prev_ask * drop and ask_gap * 100 >= self.min_gap:
+            self._last_alert[token_id] = now
+            signal = AlertSignal(
+                strategy="LIQ VACUUM",
+                market_name=f"{mkt.question[:60]} ({outcome})",
+                edge_cents=ask_gap * 50,
+                confidence=min(75, int(40 + ask_gap * 200)),
+                entry_price=best_ask,
+                entry_side="BUY YES",
+                target_price=round(best_ask + ask_gap * 0.5, 3),
+                stop_price=round(best_bid - 0.01, 3),
+                depth_available=ask_d,
+                time_horizon="1-15 min",
+                url=mkt.url(),
+                details=(
+                    f"Ask depth: {as_money(prev_ask)} → {as_money(ask_d)} "
+                    f"({(1 - ask_d / prev_ask) * 100:.0f}% drop)\n"
+                    f"Gap: {ask_gap * 100:.1f}¢ — price should move up to fill vacuum"
+                ),
+            )
+
+        # Bid vacuum → price down
+        elif prev_bid > self.min_prev and bid_d < prev_bid * drop and bid_gap * 100 >= self.min_gap:
+            self._last_alert[token_id] = now
+            signal = AlertSignal(
+                strategy="LIQ VACUUM",
+                market_name=f"{mkt.question[:60]} ({outcome})",
+                edge_cents=bid_gap * 50,
+                confidence=min(75, int(40 + bid_gap * 200)),
+                entry_price=best_bid,
+                entry_side="SELL YES",
+                target_price=round(best_bid - bid_gap * 0.5, 3),
+                stop_price=round(best_ask + 0.01, 3),
+                depth_available=bid_d,
+                time_horizon="1-15 min",
+                url=mkt.url(),
+                details=(
+                    f"Bid depth: {as_money(prev_bid)} → {as_money(bid_d)} "
+                    f"({(1 - bid_d / prev_bid) * 100:.0f}% drop)\n"
+                    f"Gap: {bid_gap * 100:.1f}¢ — price should move down to fill vacuum"
+                ),
+            )
+
+        return signal
+
+
+# ═══════════════════════════════════════════
+# Alpha Engine — Main Orchestrator
+# ═══════════════════════════════════════════
+
+class AlphaEngine:
+    """
+    Combines all strategies, manages the WebSocket feed,
+    background threads, and alert dispatch.
+    """
+
+    def __init__(
+        self,
+        poly_markets: Dict[str, PolyMarket],
+        kalshi: Optional[KalshiClient] = None,
+        logger: Optional[AlertLogger] = None,
+        telegram: bool = True,
+        min_arb_edge: float = 1.5,
+        imbalance_threshold: float = 3.0,
+        vwap_deviation: float = 8.0,
+        toxicity_threshold: float = 0.65,
+        arb_poll_sec: float = 5.0,
+    ):
+        self.poly_markets = poly_markets
+        self.token_ids = list(poly_markets.keys())
+        self.logger = logger or AlertLogger()
+        self.telegram = telegram
+        self.arb_poll = arb_poll_sec
+
+        # Strategies
+        self.imbalance = OrderbookImbalance(poly_markets, imbalance_threshold=imbalance_threshold)
+        self.vwap = VWAPDivergence(poly_markets, min_deviation_pct=vwap_deviation)
+        self.toxicity = FlowToxicity(poly_markets, toxicity_threshold=toxicity_threshold)
+        self.vacuum = LiquidityVacuum(poly_markets)
+
+        self.arb: Optional[CrossPlatformArbitrage] = None
+        if kalshi and kalshi.enabled:
+            self.arb = CrossPlatformArbitrage(kalshi, poly_markets, min_edge_cents=min_arb_edge)
+
+        # Stats
+        self._t0 = time.time()
+        self._msg_count = 0
+        self._alert_count = 0
+        self._trade_count = 0
+        self._last_msg_ts = time.time()
+
+    # ── emit ──
+
+    def _emit(self, signal: AlertSignal) -> None:
+        self._alert_count += 1
+        msg = signal.format()
+        print(f"\n{'=' * 60}\n{msg}\n{'=' * 60}\n")
+        self.logger.log(signal)
         if self.telegram:
-            send_telegram_message(body)
+            send_telegram(msg)
 
-    def _outcome_for(self, meta: MarketMeta, aid: str) -> str:
-        if meta.outcomes and aid in meta.clob_token_ids:
-            idx = meta.clob_token_ids.index(aid)
-            if 0 <= idx < len(meta.outcomes):
-                return meta.outcomes[idx]
-        return "n/a"
+    # ── level parser ──
 
-    # ---------- price alerts ----------
-
-    def _handle_price_change(self, p: dict) -> None:
-        ts = int(p.get("timestamp") or now_ms())
-        ws_market_id = p.get("market", "")
-
-        for pc in p.get("price_changes", []) or []:
-            aid = normalize_token_id(pc.get("asset_id", ""))
-            meta = self.asset_to_meta.get(aid)
-            if not meta:
+    @staticmethod
+    def _parse_levels(levels: Any) -> List[Tuple[float, float]]:
+        out: List[Tuple[float, float]] = []
+        if not isinstance(levels, list):
+            return out
+        for lv in levels:
+            if isinstance(lv, (list, tuple)) and len(lv) >= 2:
+                px, sz = safe_float(lv[0]), safe_float(lv[1])
+            elif isinstance(lv, dict):
+                px = safe_float(lv.get("price") or lv.get("p"))
+                sz = safe_float(lv.get("size") or lv.get("s"))
+            else:
                 continue
+            if px is not None and sz is not None:
+                out.append((px, sz))
+        return out
 
-            odds = compute_odds(pc.get("best_bid"), pc.get("best_ask"))
-            if odds is None or odds <= 0:
+    # ── WS handlers ──
+
+    def _handle_book(self, data: Dict[str, Any]) -> None:
+        token_id = data.get("asset_id") or data.get("token_id") or data.get("market")
+        if not token_id or token_id not in self.poly_markets:
+            return
+
+        book = data.get("book") if isinstance(data.get("book"), dict) else data
+        bids = self._parse_levels(book.get("bids") or [])
+        asks = self._parse_levels(book.get("asks") or [])
+        if not bids or not asks:
+            return
+
+        best_bid = max(p for p, _ in bids)
+        best_ask = min(p for p, _ in asks)
+        mid = (best_bid + best_ask) / 2
+
+        self.vwap.update_mid(token_id, mid)
+        self.toxicity.update_quote(token_id, best_bid, best_ask)
+
+        if sig := self.imbalance.update(token_id, bids, asks):
+            self._emit(sig)
+        if sig := self.vacuum.update(token_id, bids, asks):
+            self._emit(sig)
+
+    def _handle_trade(self, data: Dict[str, Any]) -> None:
+        raw = data.get("trades")
+        trades: List[Dict[str, Any]] = []
+        if isinstance(raw, list):
+            trades = [t for t in raw if isinstance(t, dict)]
+        elif isinstance(raw, dict):
+            trades = [raw]
+        elif any(k in data for k in ("asset_id", "token_id", "price", "size")):
+            trades = [data]
+
+        for tr in trades:
+            tid = (
+                tr.get("asset_id") or tr.get("token_id")
+                or tr.get("market") or data.get("asset_id") or data.get("token_id")
+            )
+            if not tid or tid not in self.poly_markets:
                 continue
+            price = safe_float(tr.get("price") or tr.get("p") or tr.get("last_trade_price"))
+            size = safe_float(tr.get("size") or tr.get("s") or tr.get("amount") or tr.get("qty"))
+            if price is None:
+                continue
+            if size is None:
+                size = 1.0
 
+            self._trade_count += 1
+            self.vwap.add_trade(tid, price, size)
+
+            if sig := self.toxicity.add_trade(tid, price, size):
+                self._emit(sig)
+
+            # Periodic VWAP check
+            if self._trade_count % 50 == 0:
+                if sig := self.vwap.check(tid):
+                    self._emit(sig)
+
+    def _handle_price_change(self, data: Dict[str, Any]) -> None:
+        for pc in data.get("price_changes", []) or []:
+            aid = pc.get("asset_id", "")
             bid = safe_float(pc.get("best_bid"))
             ask = safe_float(pc.get("best_ask"))
-            spread = (ask - bid) if (bid is not None and ask is not None) else None
+            if aid and bid and ask:
+                self.vwap.update_mid(aid, (bid + ask) / 2)
+                self.toxicity.update_quote(aid, bid, ask)
 
-            self.price_history[aid].append(PricePoint(ts, odds))
+    # ── background threads ──
 
-            window_start = ts - self.window_ms
-            while self.price_history[aid] and self.price_history[aid][0].ts < window_start:
-                self.price_history[aid].popleft()
+    def _arb_loop(self) -> None:
+        if not self.arb:
+            return
+        time.sleep(5)
+        try:
+            self.arb.discover_pairs()
+        except Exception as e:
+            print(f"[arb] Discovery error: {e}")
 
-            if len(self.price_history[aid]) < 2:
-                continue
+        while True:
+            try:
+                for sig in self.arb.check_all_pairs():
+                    self._emit(sig)
+            except Exception as e:
+                print(f"[arb] Poll error: {e}")
+            time.sleep(self.arb_poll)
 
-            start = self.price_history[aid][0]
-            if start.odds <= 0:
-                continue
+    def _rediscovery_loop(self) -> None:
+        if not self.arb:
+            return
+        while True:
+            time.sleep(1800)
+            try:
+                print("[arb] Re-discovering pairs...")
+                self.arb.discover_pairs()
+            except Exception as e:
+                print(f"[arb] Rediscovery error: {e}")
 
-            change = (odds - start.odds) / start.odds
-            if abs(change) < self.move_threshold:
-                continue
+    def _vwap_sweep_loop(self) -> None:
+        """Periodically check VWAP divergence for all tracked tokens."""
+        while True:
+            time.sleep(120)
+            for tid in list(self.vwap._mid.keys()):
+                try:
+                    if sig := self.vwap.check(tid):
+                        self._emit(sig)
+                except Exception:
+                    pass
 
-            vol = meta.volume or 0.0
-            liq = meta.liquidity or 0.0
-            if vol < self.min_volume or liq < self.min_liquidity:
-                continue
-            if spread is not None and spread > self.max_spread:
-                continue
-
-            if ts - self.last_price_alert_ms.get(aid, 0) < 60_000:
-                continue
-            self.last_price_alert_ms[aid] = ts
-
-            direction = "UP" if change > 0 else "DOWN"
-            outcome = self._outcome_for(meta, aid)
-            pct = change * 100.0
-
-            body = (
-                "=== POLY ALERT ===\n"
-                f"when: {fmt_ts(now_ms())}\n"
-                f"market: {meta.title()}\n"
-                f"outcome: {outcome}\n"
-                f"move: {direction} {pct:.2f}%\n"
-                f"from: {start.odds:.4f} → {odds:.4f}\n"
-                f"volume: {as_money(meta.volume)}\n"
-                f"liquidity: {as_money(meta.liquidity)}\n"
-                f"spread: {fmt_spread(spread)}\n"
-                f"asset_id: {aid}\n"
-                "==================\n"
+    def _heartbeat_loop(self) -> None:
+        while True:
+            time.sleep(60)
+            elapsed = time.time() - self._t0
+            rate = self._trade_count / max(1, elapsed / 60)
+            arb_pairs = len(self.arb.pairs) if self.arb else 0
+            print(
+                f"[heartbeat] up={elapsed / 60:.0f}m | msgs={self._msg_count} | "
+                f"trades={self._trade_count} ({rate:.1f}/m) | alerts={self._alert_count} | "
+                f"arb_pairs={arb_pairs}"
             )
 
-            self.logger.log({
-                "ts_ms": now_ms(),
-                "ts_iso": fmt_ts(now_ms()),
-                "market_title": meta.market_question,
-                "event_title": meta.event_title,
-                "outcome": outcome,
-                "from_odds": start.odds,
-                "to_odds": odds,
-                "move_pct": pct,
-                "volume": meta.volume,
-                "liquidity": meta.liquidity,
-                "best_bid": bid,
-                "best_ask": ask,
-                "spread": spread,
-                "asset_id": aid,
-                "ws_market_id": ws_market_id,
-                "alert_type": "price_move",
-                "notional": None,
-                "decision": None,
-                "notes": None,
-                "result": "OPEN",
-                "pnl": None,
-            })
+    # ── main run ──
 
-            self._send(f"[Polymarket] {direction} {pct:.1f}%", body)
-
-    # ---------- whale alerts ----------
-
-    def _handle_trade_event(self, p: dict) -> None:
-        if not self.whale_threshold or self.whale_threshold <= 0:
+    def run(self) -> None:
+        if not self.token_ids:
+            print("[engine] No markets to monitor")
             return
 
-        ws_market_id = p.get("market", "")
-        ts = int(p.get("timestamp") or now_ms())
+        # Background threads
+        for fn in (self._arb_loop, self._rediscovery_loop, self._vwap_sweep_loop, self._heartbeat_loop):
+            threading.Thread(target=fn, daemon=True).start()
 
-        # trade-like payloads can appear as:
-        # - {"trades": [...]}                 (event_type="trade")
-        # - {"trades": {...}}                 (sometimes a single object)
-        # - {...single trade fields...}       (event_type="last_trade_price" or similar)
-        raw_trades = p.get("trades")
-        trades: List[dict] = []
-        if isinstance(raw_trades, list):
-            trades = [t for t in raw_trades if isinstance(t, dict)]
-        elif isinstance(raw_trades, dict):
-            trades = [raw_trades]
-        else:
-            # If payload itself looks trade-like, treat it as a single trade object.
-            if any(k in p for k in ("asset_id", "price", "last_trade_price", "qty", "size", "amount")):
-                trades = [p]
+        max_tokens = 1800
+        sub_ids = self.token_ids[:max_tokens]
 
-        for trade in trades:
-            aid = normalize_token_id(trade.get("asset_id", ""))
-            meta = self.asset_to_meta.get(aid)
-            if not meta:
-                continue
-
-            # Extract transaction_hash for deduplication (if available)
-            tx_hash = trade.get("transaction_hash") or p.get("transaction_hash")
-            if tx_hash:
-                # Normalize hash (strip 0x prefix for consistency)
-                tx_hash_normalized = tx_hash.lower().lstrip("0x")
-                if tx_hash_normalized in self._seen_tx_hashes:
-                    # Skip duplicate transaction
-                    continue
-                # Add to seen set
-                self._seen_tx_hashes.add(tx_hash_normalized)
-                # Prune if set gets too large (keep most recent)
-                if len(self._seen_tx_hashes) > self._max_seen_tx_hashes:
-                    # Remove oldest 20% (simple approach: convert to list, slice, recreate set)
-                    # In practice, this is rare since we're tracking unique hashes
-                    excess = len(self._seen_tx_hashes) - int(self._max_seen_tx_hashes * 0.8)
-                    if excess > 0:
-                        to_remove = list(self._seen_tx_hashes)[:excess]
-                        self._seen_tx_hashes = self._seen_tx_hashes - set(to_remove)
-
-            # Support multiple possible field names depending on event schema
-            price = safe_float(
-                trade.get("price")
-                or trade.get("last_trade_price")
-                or trade.get("trade_price")
-                or trade.get("fill_price")
-            )
-            qty = safe_float(
-                trade.get("qty")
-                or trade.get("size")
-                or trade.get("amount")
-                or trade.get("volume")
-            )
-            if price is None or qty is None:
-                continue
-
-            notional = price * qty
-            if notional < self.whale_threshold:
-                continue
-
-            last = self.last_whale_alert_s.get(aid, 0.0)
-            if time.time() - last < float(self.whale_cooldown_sec):
-                continue
-            self.last_whale_alert_s[aid] = time.time()
-
-            outcome = self._outcome_for(meta, aid)
-            body = (
-                "=== POLY WHALE ALERT ===\n"
-                f"when: {fmt_ts(ts)}\n"
-                f"market: {meta.title()}\n"
-                f"outcome: {outcome}\n"
-                f"trade price: {price:.4f}\n"
-                f"trade size: {qty:.2f}\n"
-                f"notional: ${notional:,.2f}\n"
-                f"threshold: ${self.whale_threshold:,.0f}\n"
-                f"volume: {as_money(meta.volume)}\n"
-                f"liquidity: {as_money(meta.liquidity)}\n"
-                f"asset_id: {aid}\n"
-                "========================\n"
-            )
-
-            self.logger.log({
-                "ts_ms": ts,
-                "ts_iso": fmt_ts(ts),
-                "market_title": meta.market_question,
-                "event_title": meta.event_title,
-                "outcome": outcome,
-                "from_odds": None,
-                "to_odds": None,
-                "move_pct": None,
-                "volume": meta.volume,
-                "liquidity": meta.liquidity,
-                "best_bid": None,
-                "best_ask": None,
-                "spread": None,
-                "asset_id": aid,
-                "ws_market_id": ws_market_id,
-                "alert_type": "whale_trade",
-                "notional": notional,
-                "decision": None,
-                "notes": None,
-                "result": "OPEN",
-                "pnl": None,
-            })
-
-            self._send(f"[Polymarket] Whale ${notional:,.0f}", body)
-
-    # ---------- websocket loop ----------
-
-    def run_forever(self) -> None:
-        if not self.asset_ids:
-            print("No assets to subscribe to.")
-            return
-
-        backoff = 5
+        strategies = ["BOOK IMBALANCE", "VWAP", "TOXIC FLOW", "LIQ VACUUM"]
+        if self.arb:
+            strategies.insert(0, "CROSS-PLATFORM ARB")
 
         def on_open(ws):
-            self._ws_connected = True
-            self._last_msg_ts = time.time()
-            self._last_pong_ts = time.time()
-            self._msg_count = 0
-            self._msg_timestamps.clear()
-            print("[ws] connected/open")
-            time.sleep(0.1)
-            ws.send(json.dumps({"type": "market", "assets_ids": self.asset_ids}))
-            print(f"[ws] subscribed to {len(self.asset_ids)} tokens (market channel)")
+            time.sleep(0.25)
+            ws.send(json.dumps({"type": "market", "assets_ids": sub_ids}))
+            print(f"[engine] Subscribed to {len(sub_ids)} tokens")
+            print(f"[engine] Active: {', '.join(strategies)}")
+
+            if self.telegram:
+                arb_info = f"{len(self.arb.pairs)} discovered" if self.arb else "disabled (no Kalshi key)"
+                send_telegram(
+                    f"🎯 Alpha Engine v2 Online\n\n"
+                    f"Tokens: {len(sub_ids)}\n"
+                    f"Strategies: {', '.join(strategies)}\n"
+                    f"Cross-platform pairs: {arb_info}\n"
+                    f"Every alert has quantified edge + entry/exit levels"
+                )
 
         def on_message(ws, msg):
-            now = time.time()
-            self._last_msg_ts = now
-            self._msg_timestamps.append(now)
-
+            self._last_msg_ts = time.time()
+            self._msg_count += 1
             try:
                 payload = json.loads(msg)
             except Exception:
                 return
-
             items = payload if isinstance(payload, list) else [payload]
-
-            self._msg_count += 1
             for it in items:
-                if isinstance(it, dict):
-                    et = it.get("event_type", "unknown")
-                    self._last_message_type = et
-                    self._debug_seen_event_types[et] += 1
-
-                    # Handle "book" events (orderbook snapshots) - count but don't log full payloads
-                    if et == "book":
-                        self._book_event_count += 1
-                        # Log summary every 100 book events
-                        if self._book_event_count % 100 == 0:
-                            print(f"[ws][book] Received {self._book_event_count} orderbook snapshot events (suppressing full logs)")
-                    
-                    # Debug sampler for unknown / unhandled event types
-                    # Note: "book" events are intentionally ignored (orderbook snapshots, too verbose)
-                    if et not in {"price_change", "trade", "last_trade_price", "book"}:
-                        if self._debug_sample_every > 0 and (self._msg_count % self._debug_sample_every == 0):
-                            try:
-                                print(f"[ws][debug] sample unknown event_type='{et}': {json.dumps(it, ensure_ascii=False)[:5000]}")
-                            except Exception:
-                                pass
-
-                    # Always sample last_trade_price occasionally so we can map schema
-                    if et == "last_trade_price":
-                        if self._debug_last_trade_sample_every > 0 and (self._debug_seen_event_types[et] % self._debug_last_trade_sample_every == 1):
-                            try:
-                                print(f"[ws][debug] sample last_trade_price payload: {json.dumps(it, ensure_ascii=False)[:8000]}")
-                            except Exception:
-                                pass
-
-                    if et == "price_change":
-                        self._handle_price_change(it)
-                    elif et in {"trade", "last_trade_price"}:
-                        self._handle_trade_event(it)
-
-        def on_pong(ws, msg):
-            self._last_pong_ts = time.time()
-            self._last_msg_ts = time.time()
+                if not isinstance(it, dict):
+                    continue
+                et = it.get("event_type", "")
+                if et == "book":
+                    self._handle_book(it)
+                elif et in ("trade", "last_trade_price") or it.get("trades") is not None:
+                    self._handle_trade(it)
+                elif et == "price_change":
+                    self._handle_price_change(it)
 
         def on_error(ws, err):
-            print(f"[ws] error: {err}")
-            self._ws_connected = False
+            print(f"[ws error] {err}")
 
         def on_close(ws, code, reason):
-            print(f"[ws] closed: code={code} reason={reason}")
-            self._ws_connected = False
-
-        def check_health():
-            while True:
-                time.sleep(30)
-                if not self._ws_connected:
-                    continue
-                now = time.time()
-                time_since_msg = now - self._last_msg_ts
-                time_since_pong = now - self._last_pong_ts
-                cutoff = now - 60
-                msgs_last_minute = sum(1 for ts in self._msg_timestamps if ts > cutoff)
-
-                if (time_since_pong > 50 and time_since_msg > self._idle_timeout_sec):
-                    print(f"[heartbeat] CONNECTION DEAD: last_msg={int(time_since_msg)}s last_pong={int(time_since_pong)}s; reconnecting")
-                    self._ws_connected = False
-                    try:
-                        if self._ws_instance:
-                            self._ws_instance.close()
-                    except Exception:
-                        pass
-                elif now - self._last_heartbeat >= self.heartbeat_sec:
-                    print(
-                        f"[heartbeat] healthy: msgs_last_min={msgs_last_minute} "
-                        f"last_msg={int(time_since_msg)}s last_pong={int(time_since_pong)}s "
-                        f"last_type={self._last_message_type} assets={len(self.asset_ids)}"
-                    )
-                    self._last_heartbeat = now
-
-        threading.Thread(target=check_health, daemon=True).start()
+            print(f"[ws close] {code}: {reason}")
 
         while True:
-            try:
-                self._ws_connected = False
-                self._ws_instance = WebSocketApp(
-                    f"{CLOB_WS_BASE}/ws/market",
-                    on_open=on_open,
-                    on_message=on_message,
-                    on_error=on_error,
-                    on_close=on_close,
-                    on_pong=on_pong,
-                )
-                self._ws_instance.run_forever(ping_interval=25, ping_timeout=10)
-            except Exception as e:
-                print(f"[ws] run_forever exception: {e}")
-                self._ws_connected = False
-
-            print(f"[ws] reconnecting in {backoff}s...")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            print("[ws] Connecting...")
+            ws = WebSocketApp(
+                f"{CLOB_WS_BASE}/ws/market",
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+            print("[ws] Reconnecting in 3s...")
+            time.sleep(3)
 
 
-# =========================
-# Main
-# =========================
+# ═══════════════════════════════════════════
+# CLI + Entry Point
+# ═══════════════════════════════════════════
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Polymarket alerts worker (price moves & whale trades)")
-    ap.add_argument("--gamma-active", action="store_true", help="Request Gamma markets with active=true.")
-    ap.add_argument("--pages", type=int, default=20, help="Number of pages of markets to fetch from Gamma.")
-    ap.add_argument("--per-page", type=int, default=100, help="Markets per page.")
-    ap.add_argument("--window-min", type=int, default=10, help="Window size (minutes) for price move detection.")
-    ap.add_argument("--move-pct", type=float, default=25.0, help="Percent move threshold.")
-    ap.add_argument("--min-volume", type=float, default=5_000, help="Minimum market volume.")
-    ap.add_argument("--min-liquidity", type=float, default=500, help="Minimum market liquidity.")
-    ap.add_argument("--max-spread", type=float, default=0.06, help="Max bid-ask spread allowed (absolute).")
-    ap.add_argument("--max-assets", type=int, default=1000, help="Max number of assets to subscribe to.")
-    ap.add_argument("--whale-threshold", type=float, default=1000.0, help="Notional USD threshold to trigger whale alerts.")
-    ap.add_argument("--whale-cooldown", type=int, default=300, help="Cooldown per asset for whale alerts (seconds).")
-    ap.add_argument("--db-path", type=str, default="data/alerts.db", help="SQLite DB path.")
-    ap.add_argument("--email", action="store_true", help="Send alerts by email.")
-    ap.add_argument("--telegram", action="store_true", help="Send alerts via Telegram.")
-    ap.add_argument("--heartbeat-sec", type=int, default=60, help="Heartbeat interval (seconds).")
-    ap.add_argument("--broad-test", action="store_true", help="Subscribe broadly (relax thresholds; for testing alerts).")
-
+    ap = argparse.ArgumentParser(description="Polymarket Alpha Engine v2 — Quantified Edge Alert System")
+    ap.add_argument("--pages", type=int, default=30, help="Gamma pages to fetch")
+    ap.add_argument("--per-page", type=int, default=100)
+    ap.add_argument("--telegram", action="store_true", help="Send alerts via Telegram")
+    ap.add_argument("--min-arb-edge", type=float, default=1.5, help="Min cross-platform arb edge (cents)")
+    ap.add_argument("--imbalance-threshold", type=float, default=3.0, help="Min bid/ask depth ratio for imbalance signal")
+    ap.add_argument("--vwap-deviation", type=float, default=8.0, help="Min VWAP deviation percent")
+    ap.add_argument("--toxicity-threshold", type=float, default=0.65, help="VPIN threshold (0-1)")
+    ap.add_argument("--arb-poll-sec", type=float, default=5.0, help="Kalshi orderbook poll interval (seconds)")
+    ap.add_argument("--db-path", type=str, default="data/alpha_engine.db", help="SQLite DB path for signal log")
     args = ap.parse_args()
 
-    # Broad-test overrides (so you see messages quickly)
-    if args.broad_test:
-        print("[config] BROAD-TEST mode enabled: relaxing thresholds")
-        args.min_volume = 0.0
-        args.min_liquidity = 0.0
-        if args.max_assets < 1000:
-            args.max_assets = 1000
-        print(f"[config] Override: min_volume={args.min_volume:g} min_liquidity={args.min_liquidity:g} max_assets={args.max_assets}")
+    print("=" * 60)
+    print("  Polymarket Alpha Engine v2")
+    print("  Quantified edge on every alert")
+    print("=" * 60)
 
-    # Always log whale config so we don't accidentally run with whale alerts disabled.
-    print(
-        "[config] Whale alerts: threshold=$%s cooldown=%ss"
-        % (f"{args.whale_threshold:,.0f}" if args.whale_threshold is not None else "0", args.whale_cooldown)
+    # Polymarket markets
+    print("\n[fetch] Loading Polymarket markets from Gamma...")
+    poly_markets = fetch_polymarket_markets(args.per_page, args.pages)
+    print(f"[fetch] Loaded {len(poly_markets)} tokens")
+
+    # Kalshi client
+    kalshi_key = os.environ.get("KALSHI_API_KEY")
+    kalshi_pem = os.environ.get("KALSHI_PRIVATE_KEY_PEM")
+    if not kalshi_pem:
+        pem_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+        if pem_path:
+            p = Path(pem_path)
+            if p.is_file():
+                kalshi_pem = p.read_text()
+
+    kalshi = KalshiClient(
+        os.getenv("KALSHI_BASE_URL", KALSHI_BASE_DEFAULT),
+        kalshi_key, kalshi_pem,
+    )
+    if kalshi.enabled:
+        print("[kalshi] API credentials loaded — CROSS-PLATFORM ARB enabled")
+    else:
+        print("[kalshi] No credentials — cross-platform arb DISABLED")
+        print("[kalshi] Set KALSHI_API_KEY + KALSHI_PRIVATE_KEY_PEM to enable")
+
+    logger = AlertLogger(args.db_path)
+
+    engine = AlphaEngine(
+        poly_markets=poly_markets,
+        kalshi=kalshi,
+        logger=logger,
+        telegram=args.telegram,
+        min_arb_edge=args.min_arb_edge,
+        imbalance_threshold=args.imbalance_threshold,
+        vwap_deviation=args.vwap_deviation,
+        toxicity_threshold=args.toxicity_threshold,
+        arb_poll_sec=args.arb_poll_sec,
     )
 
-    backoff_sec = 60
-    max_backoff = 600
-
-    while True:
-        metas, raw_count = fetch_gamma_markets(
-            args.per_page,
-            args.pages,
-            active_only=args.gamma_active,
-            broad_test=args.broad_test,
-        )
-        total_assets = sum(len(m.clob_token_ids) for m in metas)
-        print(f"Loaded {len(metas)} markets from Gamma (assets total: {total_assets})")
-
-        logger = AlertLoggerSQLite(args.db_path)
-
-        watcher = MarketWatcher(
-            metas,
-            window_min=args.window_min,
-            move_pct=args.move_pct,
-            min_volume=args.min_volume,
-            min_liquidity=args.min_liquidity,
-            max_spread=args.max_spread,
-            max_assets=args.max_assets,
-            whale_threshold=args.whale_threshold,
-            whale_cooldown_sec=args.whale_cooldown,
-            email=args.email,
-            telegram=args.telegram,
-            logger=logger,
-            heartbeat_sec=args.heartbeat_sec,
-            broad_test=args.broad_test,
-        )
-
-        if not watcher.asset_ids:
-            print(
-                f"[WARNING] No assets selected (raw_markets={raw_count}, metas={len(metas)}). "
-                f"Retrying in {backoff_sec}s..."
-            )
-            time.sleep(backoff_sec)
-            backoff_sec = min(backoff_sec * 2, max_backoff)
-            continue
-
-        backoff_sec = 60
-
-        # Send startup notifications
-        if args.telegram:
-            startup_msg = (
-                "🚀 Polymarket Alerts Bot Started\n\n"
-                f"✅ Subscribed to {len(watcher.asset_ids)} assets\n"
-                f"📊 Monitoring {len(metas)} markets\n"
-                f"🐋 Whale threshold: ${args.whale_threshold:,.0f}\n"
-                f"📈 Price move threshold: {args.move_pct:.1f}% over {args.window_min}min"
-            )
-            send_telegram_message(startup_msg)
-            print("[startup] Telegram startup message sent")
-        if args.email:
-            send_email("[Polymarket] Worker started", "Polymarket alerts worker started ✅")
-            print("[startup] Email startup notification sent")
-
-        watcher.run_forever()
-        print("[main] watcher.run_forever() returned; refetching markets...")
-        time.sleep(10)
+    engine.run()
 
 
 if __name__ == "__main__":
